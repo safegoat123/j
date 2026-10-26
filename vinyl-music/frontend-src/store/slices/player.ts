@@ -145,16 +145,7 @@ export const removeFromQueue = (pos: number): Thunk => (d, g) => {
   if (current(g().player)) d(startCurrent());
   else { audioEngine.pause(); d(playerActions._sync({ isPlaying: false })); }
 };
-/** Stop playback, detach the current media source, and clear the queue. */
-export const stopAndClear = (): Thunk => (d) => {
-  audioEngine.pause();
-  audioEngine.element.removeAttribute('src');
-  audioEngine.element.load();
-  d(playerActions.clearQueue());
-};
-
-/** Backwards-compatible name for existing callers. */
-export const clearQueue = stopAndClear;
+export const clearQueue = (): Thunk => (d) => { audioEngine.pause(); d(playerActions.clearQueue()); };
 
 // 실제 오디오 이벤트 -> Redux. store 생성 직후 한 번만 호출. 반환값은 해제 함수.
 export const bindAudioEvents = (store: { dispatch: Dispatch; getState: () => { player: PlayerState } }) => {
