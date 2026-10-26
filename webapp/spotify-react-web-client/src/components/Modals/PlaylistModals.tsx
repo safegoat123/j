@@ -25,8 +25,10 @@ export function PlaylistModals() {
     const n = name.trim(); if (!n) return;
     try {
       const p = await create({ name: n }).unwrap(); setName('');
-      if (pickerIds?.length) await addTo(p.id, p.name);
-      else { dispatch(uiActions.closeCreatePlaylist()); navigate(`/playlist/${p.id}`); }
+      if (pickerIds?.length) {
+        await addTo(p.id, p.name);
+        dispatch(uiActions.closeCreatePlaylist());
+      } else { dispatch(uiActions.closeCreatePlaylist()); navigate(`/playlist/${p.id}`); }
     } catch (e) { message.error(errorMessage(e)); }
   };
   return <>
