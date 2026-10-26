@@ -1,0 +1,3 @@
+recursive-include mornye/frontend *
+recursive-include mornye/extensions *
+recursive-include mornye/tui *.tcss

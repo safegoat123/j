@@ -1,0 +1,90 @@
+# Example compose file for Mornye's --web mode (see the "Web Mode in
+# Docker" section of README.md). Named *.example.yml — plain docker-compose.yml
+# is in .gitignore, presumably for a maintainer-local one — so this can be
+# committed and reviewed like any other file. Copy/rename it, adjust the
+# bind mount paths and MORNYE_REGISTRIES, and run:
+#   docker compose -f docker-compose.example.yml up
+#
+# --web mode needs none of the Xvfb/VNC machinery the CLI/--gui paths use,
+# so this is the lightest way to run Mornye as a always-on service.
+#
+# No registry is bundled by design (see README > Extensions): set
+# MORNYE_REGISTRIES yourself, either below or in a sibling .env file
+# compose picks up automatically.
+#
+# Every variable the container understands is listed, with its default, in
+# docs/guide/docker.md ("Environment variables"). This file sets the ones a
+# first run needs; docker-compose.portainer.yml carries the full set.
+services:
+  mornye-web:
+    # Swap for the published image if you don't want to build locally:
+    # image: ghcr.io/mornyeapp/mornye-python:latest
+    build: .
+    command: ["--web", "--host", "0.0.0.0", "--port", "8000"]
+    # Who the container runs as. Set PUID/PGID (here, in .env, or in your
+    # shell) to the owner of the directories mounted below — `id -u` / `id -g`
+    # on the host. No root is involved; the directories must already be
+    # writable by that user.
+    #
+    # If they are not (a named volume, a directory Docker created for you),
+    # use the root-assisted variant instead: replace this line with
+    # `user: "0:0"` and uncomment PUID/PGID under `environment`. The
+    # entrypoint then chowns the data directories and drops to PUID:PGID
+    # before anything else runs.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "8000:8000"
+    # A download can hit a Turnstile challenge, which launches a real
+    # Chromium; it crashes on Docker's default 64 MB /dev/shm.
+    shm_size: "1gb"
+    environment:
+      # Comma-separated registry JSON URLs — required, nothing is bundled.
+      MORNYE_REGISTRIES: "${MORNYE_REGISTRIES:-}"
+      # Optional shared-secret gate for the web GUI (see README > Web Mode).
+      # Leave unset only if this port is never reachable from outside a
+      # network you fully trust.
+      MORNYE_WEB_TOKEN: "${MORNYE_WEB_TOKEN:-}"
+      # Where --web saves music, and where the database / extensions /
+      # settings live. Both are container paths and must match the right-hand
+      # side of a volume below — change the two together. Without the first,
+      # --web saves to ~/Music/Mornye, which is not mounted here.
+      MORNYE_DOWNLOAD_DIR: "${MORNYE_DOWNLOAD_DIR:-/app/downloads}"
+      MORNYE_DATA_DIR: "${MORNYE_DATA_DIR:-/home/mornye/.mornye}"
+      # Animated Apple Music album artwork. Set the first value to 1 to
+      # enable it by default; the Settings toggle can still override it.
+      MORNYE_ANIMATED_ARTWORKS_ENABLED: "${MORNYE_ANIMATED_ARTWORKS_ENABLED:-0}"
+      MORNYE_ANIMATED_ARTWORKS_API_URL: "${MORNYE_ANIMATED_ARTWORKS_API_URL:-https://artwork.m8tec.top}"
+      # Root-assisted variant only (see `user:` above):
+      # PUID: "${PUID:-1000}"
+      # PGID: "${PGID:-1000}"
+      # Plain lines instead of animated bars, which `docker logs` mangles.
+      MORNYE_PROGRESS_BARS: "${MORNYE_PROGRESS_BARS:-0}"
+    volumes:
+      # host path : container path. The host side is yours to choose, e.g.
+      #   - /mnt/media/music:/app/downloads
+      - ./downloads:/app/downloads
+      # Database, installed extensions, signed sessions, web users, settings
+      # and the cache (in .cache/ inside it) — one directory holds all of it.
+      - ./.mornye_docker:/home/mornye/.mornye
+    restart: unless-stopped
+    healthcheck:
+      # --web is the one run mode this compose file commits to, so (unlike
+      # the image's other modes — a one-shot CLI download, or --gui behind
+      # VNC) an HTTP check here is actually meaningful. No curl/wget in the
+      # base image, so this uses Python's own stdlib instead of adding one.
+      #
+      # /healthz rather than /: it answers the yes/no question directly
+      # instead of rendering the whole frontend to do it, and it is exempt
+      # from --web-token, so enabling authentication doesn't make the
+      # container report itself unhealthy.
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

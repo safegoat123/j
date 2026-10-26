@@ -1,0 +1,898 @@
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from mornye.app import MornyeAPI
+from mornye.client import AsyncMornye
+from mornye.core import (
+    download_validation,
+    ffmpeg_check,
+    link_resolver,
+    playlist_sync,
+    tagger,
+    transcode,
+)
+from mornye.core.base import BaseProvider
+from mornye.core.history import HistoryManager
+from mornye.core.isrc_utils import is_valid_isrc, normalize_isrc
+from mornye.core.local_scanner import scan_file
+from mornye.core.models import (
+    DownloadResult,
+    TrackMetadata,
+    build_filename,
+    sanitize,
+)
+from mornye.core.profiles import ProfileConfig
+from mornye.core.quality import (
+    map_amazon_community_quality,
+    normalize_quality,
+    quality_fallback_chain,
+    quality_for_provider,
+)
+from mornye.downloader import DownloadOptions
+from mornye.extensions import registry_config
+from mornye.extensions.manager import (
+    ExtensionManager,
+    InstalledExtension,
+    RegistryEntry,
+)
+
+
+def test_normalize_isrc_strips_prefix_and_validates():
+    assert normalize_isrc(" isrc:usabc1234567 ") == "USABC1234567"
+    assert normalize_isrc("invalid") == ""
+    assert is_valid_isrc("USABC1234567") is True
+    assert is_valid_isrc("INVALID") is False
+
+
+def test_quality_helpers_normalize_and_fallbacks():
+    """Verify quality normalization, fallback chains, and provider-specific tokens."""
+    assert normalize_quality("27") == "HI_RES_LOSSLESS"
+    assert normalize_quality("low") == "LOW"
+    assert quality_fallback_chain("hi_res_lossless") == [
+        "HI_RES_LOSSLESS",
+        "LOSSLESS",
+    ]
+    assert quality_fallback_chain("LOSSLESS") == ["LOSSLESS"]
+    assert quality_for_provider("ext:qobuz-web", "HI_RES_LOSSLESS") == "27"
+    assert quality_for_provider("qobuz", "HI_RES") == "7"
+    assert quality_for_provider("tidal", "LOSSLESS") == "LOSSLESS"
+    assert quality_for_provider("pandora_native", "LOSSLESS") == "mp3_192"
+    assert quality_for_provider("gdstudio-py", "LOSSLESS") == "FLAC"
+    # Dolby Atmos is Tidal-exclusive: Tidal gets it as-is, everyone else is
+    # treated as HI_RES_LOSSLESS instead (never a token they can't use).
+    assert map_amazon_community_quality("DOLBY_ATMOS") == "24"
+    assert map_amazon_community_quality("HI_RES_LOSSLESS") == "24"
+
+
+def test_dolby_atmos_is_exclusive_to_tidal():
+    assert quality_for_provider("tidal", "DOLBY_ATMOS") == "DOLBY_ATMOS"
+    assert quality_for_provider("ext:tidal-web", "DOLBY_ATMOS") == "DOLBY_ATMOS"
+
+    # Every other provider is treated as HI_RES_LOSSLESS instead — same
+    # token that provider's own quality_for_provider branch would produce
+    # for an actual HI_RES_LOSSLESS request.
+    assert quality_for_provider("qobuz", "DOLBY_ATMOS") == quality_for_provider(
+        "qobuz", "HI_RES_LOSSLESS"
+    )
+    assert quality_for_provider("amazon", "DOLBY_ATMOS") == quality_for_provider(
+        "amazon", "HI_RES_LOSSLESS"
+    )
+    assert quality_for_provider("apple", "DOLBY_ATMOS") == quality_for_provider(
+        "apple", "HI_RES_LOSSLESS"
+    )
+    assert quality_for_provider("deezer", "DOLBY_ATMOS") == quality_for_provider(
+        "deezer", "HI_RES_LOSSLESS"
+    )
+    assert quality_for_provider("soundcloud", "DOLBY_ATMOS") == quality_for_provider(
+        "soundcloud", "HI_RES_LOSSLESS"
+    )
+
+
+def test_soundcloud_is_not_a_default_metadata_enrichment_provider():
+    """SoundCloud remains a selectable enrichment provider (CLI --enrich-
+    providers choices, the interactive wizard's options, the GUI checklist
+    item) but is no longer checked/included by default anywhere.
+    """
+    default_providers = DownloadOptions(output_dir=".").enrich_providers
+    assert "soundcloud" not in default_providers
+    assert default_providers == ["deezer", "apple", "qobuz", "tidal"]
+
+    assert "soundcloud" not in ProfileConfig().enrich_providers
+    assert ProfileConfig().enrich_providers == ["deezer", "apple", "qobuz", "tidal"]
+
+
+def test_track_metadata_strips_artists_and_builds_tags():
+    md = TrackMetadata(
+        id="track-1",
+        title="Song Title",
+        artists="A & B / C feat. D",
+        album="Album Name",
+        album_artist="Album Artist / Guest",
+        isrc="USABC1234567",
+        track_number=3,
+        disc_number=2,
+        total_tracks=10,
+        total_discs=3,
+        duration_ms=31000,
+        release_date="2024-01-15",
+        external_url="https://example.com/track",
+        publisher="Label",
+        is_explicit=True,
+    )
+
+    assert md.artists == "A, B, C, D"
+    assert md.album_artist == "Album Artist, Guest"
+    assert md.first_artist == "A"
+    assert md.duration_seconds == 31.0
+
+    tags = md.as_flac_tags()
+    assert tags["TITLE"] == "Song Title"
+    assert tags["ARTIST"] == "A, B, C, D"
+    assert tags["ISRC"] == "USABC1234567"
+    assert tags["URL"] == "https://example.com/track"
+    assert tags["ITUNESADVISORY"] == "1"
+
+
+def test_download_result_requires_file_path_when_successful():
+    with pytest.raises(ValueError):
+        DownloadResult(success=True, provider="tidal")
+
+    ok = DownloadResult.ok("tidal", "/tmp/file.flac", fmt="flac")
+    assert ok.success is True
+    assert ok.file_path == "/tmp/file.flac"
+
+
+def test_sanitize_and_build_filename_are_filesystem_safe():
+    value = 'Song / Name? "quoted"'
+    assert sanitize(value) == "Song Name quoted"
+
+    md = TrackMetadata(
+        id="t-2",
+        title="Song / Name?",
+        artists="Artist / Guest",
+        album="Album: 2024",
+        album_artist="Album Artist",
+        release_date="2024-03-01",
+        track_number=7,
+    )
+
+    filename = build_filename(
+        md,
+        "{artist} - {title}",
+        position=7,
+        include_track_number=False,
+        extension=".mp3",
+    )
+
+    assert filename == "Artist, Guest - Song Name.mp3"
+    assert filename.endswith(".mp3")
+
+
+def test_local_scan_uses_plain_filename_as_title_when_no_tags(monkeypatch, tmp_path):
+    file_path = tmp_path / "plain_track.flac"
+    file_path.write_bytes(b"fake-flac-data")
+
+    class FakeEmbedded:
+        tags = {}
+        cover_data = None
+        cover_mime = None
+
+    monkeypatch.setattr(
+        "mornye.core.local_scanner.read_embedded_tags", lambda _p: FakeEmbedded()
+    )
+
+    info = scan_file(file_path)
+    assert info.guessed_title == "plain track"
+    assert info.search_title == "plain track"
+    assert info.error == ""
+
+
+def test_local_scan_handles_title_before_artist_in_filename(monkeypatch, tmp_path):
+    file_path = tmp_path / "Ouverture - Lazza, Low Kidd.flac"
+    file_path.write_bytes(b"fake-flac-data")
+
+    class FakeEmbedded:
+        tags = {}
+        cover_data = None
+        cover_mime = None
+
+    monkeypatch.setattr(
+        "mornye.core.local_scanner.read_embedded_tags", lambda _p: FakeEmbedded()
+    )
+
+    info = scan_file(file_path)
+    assert info.guessed_title == "Ouverture"
+    assert info.guessed_artist == "Lazza, Low Kidd"
+    assert info.search_title == "Ouverture"
+    assert info.error == ""
+
+
+def test_browse_folder_lists_directories_and_files(tmp_path):
+    base = tmp_path / "music"
+    nested = base / "nested"
+    nested.mkdir(parents=True)
+    file_path = base / "track.flac"
+    file_path.write_bytes(b"fake-flac-data")
+
+    result = MornyeAPI().browse_folder(str(base))
+
+    assert nested.name in result["directories"]
+    assert file_path.name in result["files"]
+
+
+def test_history_manager_round_trip(tmp_path):
+    manager = HistoryManager()
+    manager.path = tmp_path / "recent-fetches.json"
+    metadata = TrackMetadata(
+        id="history-1",
+        title="Track",
+        artists="Artist",
+        album="Album",
+        album_artist="Artist",
+        track_number=1,
+    )
+
+    manager.add(metadata)
+    history = manager.get_all()
+
+    assert len(history) == 1
+    assert history[0]["id"] == "history-1"
+    assert "fetched_at" in history[0]
+
+    manager.clear()
+    assert manager.get_all() == []
+
+
+def test_history_manager_handles_invalid_json(tmp_path):
+    manager = HistoryManager()
+    manager.path = tmp_path / "recent-fetches.json"
+    manager.path.write_text("{not valid json", encoding="utf-8")
+
+    assert manager.get_all() == []
+
+
+def test_download_validation_rejects_preview_and_accepts_missing_duration(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "preview.flac"
+    path.write_bytes(b"fake-audio")
+
+    async def _run():
+        async def fake_duration(_filepath: str) -> float:
+            return 15.0
+
+        removed = {}
+
+        async def fake_remove(filepath: str) -> None:
+            removed["path"] = filepath
+
+        monkeypatch.setattr(
+            download_validation, "_get_audio_duration_async", fake_duration
+        )
+        monkeypatch.setattr(download_validation, "_remove_file_async", fake_remove)
+
+        ok, msg = await download_validation.validate_downloaded_track_async(
+            str(path), 180
+        )
+        assert ok is False
+        assert "Preview" in msg
+        assert removed["path"] == str(path)
+
+        async def fake_missing_duration(_filepath: str) -> float:
+            return 0.0
+
+        monkeypatch.setattr(
+            download_validation, "_get_audio_duration_async", fake_missing_duration
+        )
+        ok2, msg2 = await download_validation.validate_downloaded_track_async(
+            str(path), 180
+        )
+        assert ok2 is True
+        assert msg2 == ""
+
+    asyncio.run(_run())
+
+
+def test_ffmpeg_check_handles_both_success_and_missing(monkeypatch, capsys):
+    def fake_success(*args, **kwargs):
+        return type("R", (), {"returncode": 0, "stdout": "ffmpeg version 7.0\n"})()
+
+    monkeypatch.setattr(ffmpeg_check.subprocess, "run", fake_success)
+    result = ffmpeg_check.check_ffmpeg()
+    assert result["available"] is True
+    assert "ffmpeg version" in result["version"]
+
+    def fake_missing(*args, **kwargs):
+        raise FileNotFoundError("ffmpeg not found in PATH")
+
+    monkeypatch.setattr(ffmpeg_check.subprocess, "run", fake_missing)
+    missing = ffmpeg_check.check_ffmpeg()
+    assert missing["available"] is False
+    assert "ffmpeg not found" in missing["error"]
+    printed = ffmpeg_check.print_ffmpeg_warning(missing)
+    assert printed == missing
+    captured = capsys.readouterr().out
+    assert "ffmpeg NOT FOUND" in captured
+
+
+def test_link_resolver_normalizes_and_extracts_links():
+    """Verify provider detection and link normalization across resolver responses."""
+    resolver = link_resolver.LinkResolver()
+
+    assert resolver.identify_provider("https://open.spotify.com/track/abc") == "spotify"
+    assert (
+        resolver.identify_provider("https://soundcloud.com/user/track") == "soundcloud"
+    )
+
+    amazon_url = (
+        "https://music.amazon.com/albums/XXXXXXXXXX?trackAsin=B07T2G5CB2&foo=bar"
+    )
+    assert resolver._normalize_amazon_url(amazon_url) == (
+        "https://music.amazon.com/tracks/B07T2G5CB2?musicTerritory=US"
+    )
+    assert resolver._normalize_deezer_url("https://www.deezer.com/track/123456") == (
+        "https://www.deezer.com/track/123456"
+    )
+
+    resolve_payload = {
+        "success": True,
+        "songUrls": {
+            "Deezer": "https://www.deezer.com/track/123456",
+            "AmazonMusic": {
+                "url": "https://music.amazon.com/albums/XXXXXXXXXX?trackAsin=B07T2G5CB2"
+            },
+            "Tidal": "https://listen.tidal.com/track/987654",
+        },
+    }
+    normalized = resolver._process_resolve_response(resolve_payload)
+    assert normalized["deezer"] == "https://www.deezer.com/track/123456"
+    assert (
+        normalized["amazonMusic"]
+        == "https://music.amazon.com/tracks/B07T2G5CB2?musicTerritory=US"
+    )
+    assert normalized["tidal"] == "https://listen.tidal.com/track/987654"
+
+    html = (
+        '<script type="application/ld+json">'
+        '{"sameAs":["https://listen.tidal.com/track/987654",'
+        '"https://music.amazon.com/tracks/B07T2G5CB2?musicTerritory=US",'
+        '"https://www.deezer.com/track/123456"]}'
+        "</script>"
+    )
+    songstats = resolver._process_songstats_links(html)
+    assert songstats["tidal"] == "https://listen.tidal.com/track/987654"
+    assert songstats["deezer"] == "https://www.deezer.com/track/123456"
+    assert (
+        songstats["amazonMusic"]
+        == "https://music.amazon.com/tracks/B07T2G5CB2?musicTerritory=US"
+    )
+
+
+def test_playlist_sync_dedup_and_rendering(tmp_path):
+    track_a = TrackMetadata(
+        id="track-1",
+        title="Song Title",
+        artists="Artist One",
+        album="Album",
+        album_artist="Artist One",
+        isrc="USABC1234567",
+        duration_ms=180000,
+    )
+    track_b = TrackMetadata(
+        id="track-2",
+        title="Song Title",
+        artists="Artist One",
+        album="Album",
+        album_artist="Artist One",
+        isrc="USABC1234567",
+        duration_ms=180000,
+    )
+    source_one = playlist_sync.PlaylistSource(
+        url="https://example.com/playlist/one",
+        name="Alpha",
+        tracks=(track_a, track_b),
+    )
+    source_two = playlist_sync.PlaylistSource(
+        url="https://example.com/playlist/two",
+        name="Beta",
+        tracks=(track_a,),
+    )
+
+    plan = playlist_sync.build_plan([source_one, source_two], m3u_format="m3u8")
+    assert len(plan.tracks) == 1
+    assert plan.playlists[0].keys == ("isrc:USABC1234567",)
+    assert plan.playlists[1].keys == ("isrc:USABC1234567",)
+    assert plan.playlists[0].file_name == "Alpha.m3u8"
+
+    index = playlist_sync.index_audio_files(tmp_path)
+    created = tmp_path / "song.flac"
+    created.write_bytes(b"audio")
+    index = playlist_sync.index_audio_files(tmp_path)
+    assert playlist_sync.find_existing(index, "song") == created
+
+    m3u = playlist_sync.render_m3u(
+        [
+            playlist_sync.M3UEntry(
+                path=created, title="Song Title", artists="Artist One", duration_s=180
+            )
+        ],
+        tmp_path / "playlist" / "Alpha.m3u8",
+    )
+    assert "#EXTM3U" in m3u
+    assert "Artist One - Song Title" in m3u
+
+
+def test_playlist_local_match_normalizes_isrc_and_checks_album(monkeypatch, tmp_path):
+    track_path = tmp_path / "renamed.flac"
+    track_path.write_bytes(b"audio")
+
+    monkeypatch.setattr(
+        playlist_sync,
+        "read_embedded_tags",
+        lambda path, include_cover=False: tagger.EmbeddedTags(
+            tags={
+                "ISRC": "US-ABC-1234567",
+                "TITLE": "Song",
+                "ARTIST": "Artist",
+                "ALBUM": "Original Album",
+            }
+        ),
+    )
+    index = playlist_sync.index_audio_files(tmp_path)
+
+    same_recording = TrackMetadata(
+        id="track-1",
+        title="Song",
+        artists="Artist",
+        album="Different Album",
+        album_artist="Artist",
+        isrc="USABC1234567",
+    )
+    assert (
+        playlist_sync.find_existing_track(index, same_recording, "missing")
+        == track_path
+    )
+
+    no_isrc_match = same_recording.model_copy(update={"isrc": ""})
+    assert playlist_sync.find_existing_track(index, no_isrc_match, "missing") is None
+
+
+def test_fetch_lyrics_respects_explicit_empty_provider_list():
+    from mornye.core.lyrics import fetch_lyrics_async
+
+    result = asyncio.run(
+        fetch_lyrics_async("Song", "Artist", providers=[]),
+    )
+    assert result == ("", "")
+
+
+def test_tagger_helpers_cover_url_and_embedded_tags():
+    base_url = "https://i.scdn.co/image/ab67616d0000abc123"
+    assert tagger.max_resolution_spotify_cover(base_url) == (
+        "https://i.scdn.co/image/ab67616d0000b273"
+    )
+
+    options = tagger.EmbedOptions(embed_lyrics=True, lyrics_providers=["spotify"])
+    assert options.embed_lyrics is True
+    assert options.lyrics_providers == ["spotify"]
+
+    payload = tagger.EmbeddedTags(
+        tags={"TITLE": "Song", "ARTIST": "Artist"}, lyrics="hello"
+    )
+    assert bool(payload) is True
+
+
+def test_transcode_helpers_and_conversion(monkeypatch, tmp_path):
+    source = tmp_path / "song.flac"
+    source.write_bytes(b"source")
+
+    assert transcode.normalize_transcode_format("mp3_320") == "mp3"
+    assert transcode.normalize_transcode_format("keep") is None
+    assert transcode.normalize_bitrate("320") == "320k"
+    assert transcode.transcoded_path(source, "mp3") == tmp_path / "song.mp3"
+    assert transcode.transcoded_file_exists(tmp_path / "missing.mp3") is False
+
+    def fake_check_ffmpeg():
+        return {"available": True, "version": "ffmpeg version 7.0", "error": ""}
+
+    monkeypatch.setattr(transcode, "check_ffmpeg", fake_check_ffmpeg, raising=False)
+    monkeypatch.setattr(transcode, "ensure_ffmpeg_available", lambda fmt: None)
+
+    async def fake_run_ffmpeg(*args):
+        dest = Path(args[-1])
+        dest.write_bytes(b"encoded")
+        return 0, ""
+
+    async def fake_transfer(src, dst):
+        return True
+
+    monkeypatch.setattr(transcode, "_run_ffmpeg", fake_run_ffmpeg)
+    monkeypatch.setattr(transcode, "transfer_tags_async", fake_transfer)
+
+    async def _run():
+        dest = await transcode.transcode_file_async(
+            source, fmt="mp3", keep_original=True
+        )
+        assert dest == tmp_path / "song.mp3"
+        assert dest.exists()
+        assert source.exists()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.uses_registry
+def test_extension_manager_deduplicates_registry_checks_in_one_process(
+    monkeypatch, tmp_path
+):
+    # Isolate from whatever real .env / registry_settings.json happen to
+    # exist on the machine running the test (e.g. a local dev .env copied
+    # from .env.example, per the README) — otherwise this test's outcome
+    # depends on the contributor's own filesystem instead of only on the
+    # env var it sets below.
+    monkeypatch.setattr(registry_config, "ENV_FILES_TO_CHECK", ())
+    monkeypatch.setattr(
+        registry_config, "CONFIG_FILE", tmp_path / "registry_settings.json"
+    )
+
+    # Snapshot original state and restore in finally block
+    original_checks = ExtensionManager._startup_registry_checks.copy()
+    try:
+        ExtensionManager._startup_registry_checks.clear()
+        calls = []
+
+        def fake_fetch_registry(self, url=None):
+            calls.append(url)
+            return [
+                RegistryEntry(
+                    id="demo-provider",
+                    display_name="Demo provider",
+                    version="1.0.0",
+                    description="",
+                    download_url="https://example.com/demo.zip",
+                    category="download_provider",
+                    tags=["download_provider"],
+                )
+            ]
+
+        monkeypatch.setattr(ExtensionManager, "fetch_registry", fake_fetch_registry)
+        monkeypatch.setattr(
+            ExtensionManager, "get_installed", lambda self, ext_id: None
+        )
+        monkeypatch.setattr(
+            ExtensionManager, "install_from_url", lambda *args, **kwargs: None
+        )
+        monkeypatch.setenv("MORNYE_REGISTRIES", "https://example.com/registry.json")
+
+        manager = ExtensionManager(
+            ext_dir=tmp_path / "exts", auto_install_downloads=True
+        )
+        manager.ensure_download_providers("https://example.com/registry.json")
+        manager.ensure_download_providers("https://example.com/registry.json")
+
+        assert calls == [["https://example.com/registry.json"]]
+
+        manager2 = ExtensionManager(
+            ext_dir=tmp_path / "exts2", auto_install_downloads=True
+        )
+        manager2.ensure_download_providers("https://example.com/registry.json")
+
+        # exts2 is a different directory, so it should trigger another fetch
+        assert calls == [
+            ["https://example.com/registry.json"],
+            ["https://example.com/registry.json"],
+        ]
+
+        manager3 = ExtensionManager(
+            ext_dir=tmp_path / "exts3", auto_install_downloads=False
+        )
+        manager3.ensure_download_providers("https://example.com/other-registry.json")
+
+        assert calls == [
+            ["https://example.com/registry.json"],
+            ["https://example.com/registry.json"],
+            ["https://example.com/other-registry.json"],
+        ]
+    finally:
+        # Restore original state
+        ExtensionManager._startup_registry_checks.clear()
+        ExtensionManager._startup_registry_checks.update(original_checks)
+
+
+@pytest.fixture
+def _fake_registry(monkeypatch, tmp_path):
+    """One unsigned download provider behind a fake registry URL, with the
+    fetch and install calls recorded. Restores the per-process check state."""
+    monkeypatch.setattr(registry_config, "ENV_FILES_TO_CHECK", ())
+    monkeypatch.setattr(
+        registry_config, "CONFIG_FILE", tmp_path / "registry_settings.json"
+    )
+    monkeypatch.setenv("MORNYE_REGISTRIES", "https://example.com/registry.json")
+    monkeypatch.delenv("MORNYE_MIN_TRUST", raising=False)
+
+    calls = {"fetch": 0, "install": 0}
+
+    def fake_fetch_registry(self, url=None):
+        calls["fetch"] += 1
+        return [
+            RegistryEntry(
+                id="demo-provider",
+                display_name="Demo provider",
+                version="1.0.0",
+                description="",
+                download_url="https://example.com/demo.zip",
+                category="download_provider",
+                tags=["download_provider"],
+            )
+        ]
+
+    def fake_install(*args, **kwargs):
+        calls["install"] += 1
+
+    monkeypatch.setattr(ExtensionManager, "fetch_registry", fake_fetch_registry)
+    monkeypatch.setattr(ExtensionManager, "get_installed", lambda self, ext_id: None)
+    monkeypatch.setattr(ExtensionManager, "install_from_url", fake_install)
+
+    original_checks = ExtensionManager._startup_registry_checks.copy()
+    ExtensionManager._startup_registry_checks.clear()
+    try:
+        yield calls
+    finally:
+        ExtensionManager._startup_registry_checks.clear()
+        ExtensionManager._startup_registry_checks.update(original_checks)
+
+
+def _age_registry_checks(seconds: float) -> None:
+    checks = ExtensionManager._startup_registry_checks
+    for key, (checked_at, floor) in list(checks.items()):
+        checks[key] = (checked_at - seconds, floor)
+
+
+@pytest.mark.uses_registry
+def test_extension_manager_rechecks_registry_after_interval(
+    _fake_registry, monkeypatch, tmp_path
+):
+    """An always-on --web process must pick up new extension versions."""
+    ext_dir = tmp_path / "exts"
+    monkeypatch.setenv("MORNYE_EXT_UPDATE_INTERVAL", "600")
+
+    ExtensionManager(ext_dir=ext_dir, auto_install_downloads=True)
+    ExtensionManager(ext_dir=ext_dir, auto_install_downloads=True)
+    assert _fake_registry == {"fetch": 1, "install": 1}
+
+    _age_registry_checks(601)
+    ExtensionManager(ext_dir=ext_dir, auto_install_downloads=True)
+    assert _fake_registry == {"fetch": 2, "install": 2}
+
+    # Zero restores the old once-per-process behaviour.
+    monkeypatch.setenv("MORNYE_EXT_UPDATE_INTERVAL", "0")
+    _age_registry_checks(10**6)
+    ExtensionManager(ext_dir=ext_dir, auto_install_downloads=True)
+    assert _fake_registry["fetch"] == 2
+
+
+@pytest.mark.uses_registry
+def test_extension_manager_recheck_keeps_startup_trust_floor(_fake_registry, tmp_path):
+    """The launcher passes --min-trust-tier only to the startup bootstrap; a
+    later re-check from the download path must not run under a weaker one."""
+    ext_dir = tmp_path / "exts"
+
+    ExtensionManager(
+        ext_dir=ext_dir, auto_install_downloads=True, min_trust_tier="signed"
+    )
+    assert _fake_registry == {"fetch": 1, "install": 0}
+
+    _age_registry_checks(10**6)
+    ExtensionManager(ext_dir=ext_dir, auto_install_downloads=True)
+    assert _fake_registry == {"fetch": 2, "install": 0}
+
+
+@pytest.mark.uses_registry
+def test_extension_manager_bootstrap_installs_every_category(monkeypatch, tmp_path):
+    """Metadata and lyrics extensions are installed too, not only download
+    providers: the metadata fallback and catalogue links can only use what
+    is installed. Utilities still go first."""
+    monkeypatch.setattr(registry_config, "ENV_FILES_TO_CHECK", ())
+    monkeypatch.setattr(
+        registry_config, "CONFIG_FILE", tmp_path / "registry_settings.json"
+    )
+    monkeypatch.setenv("MORNYE_REGISTRIES", "https://example.com/registry.json")
+    monkeypatch.delenv("MORNYE_MIN_TRUST", raising=False)
+
+    def entry(ext_id, category, tags):
+        return RegistryEntry(
+            id=ext_id,
+            display_name=ext_id,
+            version="1.0.0",
+            description="",
+            download_url=f"https://example.com/{ext_id}.zip",
+            category=category,
+            tags=tags,
+        )
+
+    entries = [
+        entry("tidal-web", "download", ["download"]),
+        entry("spotify-web", "integration", ["spotify", "homefeed"]),
+        entry("apple-music", "integration", ["apple", "lyrics"]),
+        entry("helper", "utility", ["utility"]),
+    ]
+    installed = []
+    monkeypatch.setattr(
+        ExtensionManager, "fetch_registry", lambda self, url=None: entries
+    )
+    monkeypatch.setattr(ExtensionManager, "get_installed", lambda self, ext_id: None)
+    monkeypatch.setattr(
+        ExtensionManager,
+        "install_from_url",
+        lambda self, url, **kwargs: installed.append(url.rsplit("/", 1)[-1]),
+    )
+
+    original_checks = ExtensionManager._startup_registry_checks.copy()
+    ExtensionManager._startup_registry_checks.clear()
+    try:
+        ExtensionManager(ext_dir=tmp_path / "exts", auto_install_downloads=True)
+    finally:
+        ExtensionManager._startup_registry_checks.clear()
+        ExtensionManager._startup_registry_checks.update(original_checks)
+
+    assert installed[0] == "helper.zip"
+    assert sorted(installed) == [
+        "apple-music.zip",
+        "helper.zip",
+        "spotify-web.zip",
+        "tidal-web.zip",
+    ]
+
+
+def test_extension_manager_skips_matching_registry_checksum(tmp_path):
+    manager = ExtensionManager(ext_dir=tmp_path, auto_install_downloads=False)
+    installed = InstalledExtension(
+        name="demo",
+        display_name="Demo",
+        version="1.0.0",
+        description="",
+        ext_dir=tmp_path / "demo",
+        manifest={"_registry_sha256": "ABC123"},
+    )
+    remote = RegistryEntry(
+        id="demo",
+        display_name="Demo",
+        version="1.0.0",
+        description="",
+        download_url="https://example.com/demo.zip",
+        sha256="abc123",
+    )
+
+    assert manager._matches_registry_entry(installed, remote) is True
+
+
+def test_extension_manager_detects_changed_registry_checksum(tmp_path):
+    manager = ExtensionManager(ext_dir=tmp_path, auto_install_downloads=False)
+    installed = InstalledExtension(
+        name="demo",
+        display_name="Demo",
+        version="1.0.0",
+        description="",
+        ext_dir=tmp_path / "demo",
+        manifest={"_registry_sha256": "old"},
+    )
+    remote = RegistryEntry(
+        id="demo",
+        display_name="Demo",
+        version="1.0.0",
+        description="",
+        download_url="https://example.com/demo.zip",
+        sha256="new",
+    )
+
+    assert manager._matches_registry_entry(installed, remote) is False
+
+
+def test_base_provider_caches_validated_flac_until_file_changes(tmp_path, monkeypatch):
+    class DummyProvider(BaseProvider):
+        async def download_track_async(self, *args, **kwargs):
+            raise NotImplementedError
+
+    path = tmp_path / "track.flac"
+    path.write_bytes(b"valid audio")
+    validations = []
+
+    def fake_validate(filepath):
+        validations.append(filepath)
+        return True, ""
+
+    monkeypatch.setattr("mornye.core.base.validate_flac_file", fake_validate)
+    provider = DummyProvider()
+
+    assert provider._file_exists(path) is True
+    assert provider._file_exists(path) is True
+    assert len(validations) == 1
+
+    path.write_bytes(b"changed audio")
+    assert provider._file_exists(path) is True
+    assert len(validations) == 2
+
+
+def test_async_client_tracks_loop_minutes_and_default_playlist_subfolders():
+    client = AsyncMornye(output_dir="./downloads")
+    assert client._opts.create_playlist_subfolders is False
+
+    calls = []
+    sleep_calls = []
+
+    async def fake_run_once(url, target_tracks=None):
+        calls.append((url, target_tracks))
+        if len(calls) == 1:
+            return [{"id": "retry-track"}]
+        return []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    client._entered = True
+    client._downloader._run_once_async = fake_run_once
+    original_sleep = asyncio.sleep
+    asyncio.sleep = fake_sleep
+
+    try:
+
+        async def _run():
+            await client.download_track(
+                "https://open.spotify.com/track/abc", loop_minutes=7
+            )
+
+        asyncio.run(_run())
+    finally:
+        asyncio.sleep = original_sleep
+
+    assert calls == [
+        ("https://open.spotify.com/track/abc", None),
+        ("https://open.spotify.com/track/abc", [{"id": "retry-track"}]),
+    ]
+    assert sleep_calls == [420]
+
+
+def test_setup_logger_leaves_a_host_application_s_logging_alone():
+    """A library does not get to decide how the program embedding it logs.
+
+    With the host's own handler on the root logger, adding one of ours put
+    a second, differently formatted copy of every record on the terminal,
+    and `propagate = False` hid the records from the host's handler
+    entirely whenever nothing had un-set it yet.
+    """
+    import logging
+
+    from mornye.client import _setup_logger
+
+    package = logging.getLogger("mornye")
+    root = logging.getLogger()
+    host = logging.NullHandler()
+
+    saved_handlers = list(package.handlers)
+    saved_propagate, saved_level = package.propagate, package.level
+    # pytest keeps handlers of its own on the root logger, and they would
+    # read as a configured host: this test is about what Mornye does with
+    # a root it was handed, so it hands it a known one.
+    saved_root_handlers = list(root.handlers)
+    root.handlers.clear()
+    package.handlers.clear()
+    package.propagate = True
+    root.addHandler(host)
+    try:
+        _setup_logger(logging.INFO)
+        assert package.handlers == []
+        assert package.propagate is True
+        # The level is an explicit argument of the public API, so it still
+        # applies — it is the *rendering* we keep our hands off.
+        assert package.level == logging.INFO
+
+        # Nothing configured: the handler is a convenience, not a hijack.
+        root.removeHandler(host)
+        _setup_logger(logging.INFO)
+        assert len(package.handlers) == 1
+        assert package.propagate is False
+    finally:
+        root.handlers[:] = saved_root_handlers
+        package.handlers[:] = saved_handlers
+        package.propagate, package.level = saved_propagate, saved_level

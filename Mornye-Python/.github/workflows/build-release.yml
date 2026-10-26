@@ -1,0 +1,383 @@
+name: Build and Release Mornye
+
+permissions:
+  contents: write
+  pull-requests: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Name of the version tag (es: v1.0.0)'
+        required: false
+        type: string
+
+jobs:
+  lint-and-bump:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.commit_and_bump.outputs.NEW_TAG }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dev dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pip install .
+
+      - name: Auto-fix with ruff and black
+        shell: bash
+        run: |
+          if command -v ruff >/dev/null 2>&1; then
+            if ! ruff check --fix .; then
+              echo "::warning::Ruff found remaining issues after automatic fixes; continuing with the release build."
+            fi
+          else
+            echo "ruff not installed"
+          fi
+          if command -v black >/dev/null 2>&1; then black .; else echo "black not installed"; fi
+
+      - name: Commit changes and bump version
+        id: commit_and_bump
+        shell: bash
+        run: |
+          # 1. Commit delle modifiche di formattazione (se esistono)
+          #
+          # The checkout above is a snapshot. Anything pushed to the branch
+          # while this job was installing its dependencies leaves it behind,
+          # and `git push` is then rejected as non-fast-forward — which used
+          # to fail the whole release over a cosmetic commit.
+          #
+          # The formatters are re-run on top of the newer tree rather than
+          # the commit being rebased onto it: a formatting commit rebased
+          # over content changes conflicts on exactly the lines it rewrote,
+          # and re-running is both conflict-free and idempotent. The result
+          # is identical either way — the branch tip, formatted.
+          #
+          # Syncing also keeps the tag honest: it is created below on local
+          # HEAD, so a HEAD that is behind the branch would tag a tree
+          # nobody has.
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          sync_and_format() {
+            git fetch origin "$BRANCH"
+            git reset --hard FETCH_HEAD
+            ruff check --fix . || true
+            black . || true
+          }
+
+          git fetch origin "$BRANCH"
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]]; then
+            echo "::warning::$BRANCH moved since checkout; re-formatting on top of its tip."
+            sync_and_format
+          fi
+
+          for attempt in 1 2 3; do
+            if [[ -z "$(git status --porcelain)" ]]; then
+              echo "No formatting changes to commit."
+              break
+            fi
+
+            echo "Format changes detected. Committing (attempt $attempt)..."
+            git add .
+            git commit -m "style: auto-fix ruff e black [skip ci]"
+
+            if git push origin "HEAD:$BRANCH"; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::Could not push the formatting commit: $BRANCH keeps moving under this job. Re-run the workflow when pushes have settled."
+              exit 1
+            fi
+            echo "::warning::Push rejected — $BRANCH moved again. Re-syncing and retrying."
+            sync_and_format
+          done
+          
+          # 2. Calcolo del nuovo Tag (Manuale o Automatico)
+          USER_INPUT="${{ github.event.inputs.version_tag }}"
+          if [[ -n "$USER_INPUT" ]]; then
+            echo "Using manually provided tag: $USER_INPUT"
+            NEW_TAG="$USER_INPUT"
+          else
+            # Recupera i tag per far funzionare correttamente 'git describe'
+            git fetch --tags
+            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
+            
+            if [[ $LATEST_TAG =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              MAJOR="${BASH_REMATCH[1]}"
+              MINOR="${BASH_REMATCH[2]}"
+              PATCH="${BASH_REMATCH[3]}"
+              
+              NEW_PATCH=$((PATCH + 1))
+              NEW_TAG="v$MAJOR.$MINOR.$NEW_PATCH"
+              echo "Auto-bumping from $LATEST_TAG to $NEW_TAG"
+            else
+              NEW_TAG="v1.0.1" 
+              echo "Regex failed on $LATEST_TAG. Falling back to default: $NEW_TAG"
+            fi
+          fi
+          
+          # 3. Creazione e Push del Tag
+          if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
+            # Deliberately a hard stop, not a force-push. A tag that already
+            # exists has been fetched by users, packaged by build-release and
+            # (once publish.yml is tag-driven) shipped to PyPI: moving it
+            # changes what "v1.2.3" means for everyone who already has it,
+            # while PyPI still serves the artifact built from the old commit.
+            # Pick the next version, or delete the tag deliberately by hand.
+            echo "::error::Tag $NEW_TAG already exists. Bump the version or remove the tag explicitly; this workflow will not move a published tag."
+            exit 1
+          else
+            echo "Creating new tag: $NEW_TAG"
+            git tag "$NEW_TAG"
+            git push origin "$NEW_TAG"
+          fi
+          
+          # 4. Output per il job di Release
+          echo "NEW_TAG=$NEW_TAG" >> $GITHUB_OUTPUT
+
+  build:
+    needs: lint-and-bump
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x86_64
+            artifact_name: Mornye-Windows.exe
+            build_name: Mornye-Windows
+
+          - os: macos-latest
+            arch: x86_64
+            artifact_name: Mornye-macOS
+            build_name: Mornye-macOS
+
+          - os: ubuntu-latest
+            arch: x86_64
+            artifact_name: Mornye-Linux-x86_64
+            build_name: Mornye-Linux-x86_64
+
+          - os: ubuntu-latest
+            arch: arm64
+            artifact_name: Mornye-Linux-arm64
+            build_name: Mornye-Linux-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+      with:
+        ref: refs/tags/${{ needs.lint-and-bump.outputs.release_tag }}
+
+    - name: Setup Python
+      if: matrix.arch == 'x86_64'
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies (x86_64 / macOS / Linux)
+      if: matrix.arch == 'x86_64'
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller certifi requests mutagen
+        pip install .
+
+    - name: Build Mornye (x86_64 / macOS / Linux)
+      if: matrix.arch == 'x86_64'
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" == "Windows" ]; then SEP=";"; else SEP=":"; fi
+        pyinstaller --onefile --name "${{ matrix.build_name }}" \
+          --collect-all mornye \
+          --add-data "mornye/frontend${SEP}mornye/frontend" \
+          --add-data "mornye/extensions${SEP}mornye/extensions" \
+          --add-data "mornye/tui${SEP}mornye/tui" \
+          --hidden-import mornye.core.signed_session_desktop \
+          --hidden-import mornye.core.signed_session_mobile \
+          --hidden-import mornye.core.signed_session_mono \
+          --console launcher.py
+
+    - name: Setup QEMU for ARM64
+      if: matrix.arch == 'arm64'
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+
+    - name: Build ARM64 Linux via Docker
+      if: matrix.arch == 'arm64'
+      shell: bash
+      run: |
+        docker run --rm --platform linux/arm64 \
+          -v "$PWD":/workspace \
+          -w /workspace python:3.12-bullseye \
+          bash -c "
+            pip install --upgrade pip && \
+            pip install pyinstaller certifi requests mutagen && \
+            pip install . && \
+            pyinstaller --onefile --name '${{ matrix.build_name }}' \
+              --collect-all mornye \
+              --add-data 'mornye/frontend:mornye/frontend' \
+              --add-data 'mornye/extensions:mornye/extensions' \
+              --add-data 'mornye/tui:mornye/tui' \
+              --hidden-import mornye.core.signed_session_desktop \
+              --hidden-import mornye.core.signed_session_mobile \
+              --hidden-import mornye.core.signed_session_mono \
+              --console launcher.py
+          "
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: bin-${{ matrix.build_name }}
+        path: dist/${{ matrix.artifact_name }}
+        retention-days: 7
+
+  release:
+      needs: [lint-and-bump, build]
+      runs-on: ubuntu-latest
+      if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+      
+      steps:
+        - name: Checkout code (For Changelog Generation)
+          uses: actions/checkout@v5
+          with:
+            fetch-depth: 0
+            ref: refs/tags/${{ needs.lint-and-bump.outputs.release_tag }}
+
+        - name: Setup Python for changelog script
+          uses: actions/setup-python@v6
+          with:
+            python-version: '3.12'
+
+        - name: Download all build artifacts
+          uses: actions/download-artifact@v4
+          with:
+            pattern: bin-*
+            path: release-files
+            merge-multiple: true
+
+        - name: Generate Changelog from CodeRabbit PR summaries
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            GITHUB_REPOSITORY: ${{ github.repository }}
+          run: |
+            pip install requests
+            python -c "
+            import os, re, subprocess, requests
+
+            repo = os.environ['GITHUB_REPOSITORY']
+            token = os.environ['GITHUB_TOKEN']
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Accept': 'application/vnd.github+json',
+            }
+
+            # Trova la data del tag precedente per delimitare l'intervallo
+            since = None
+            try:
+                prev_tag = subprocess.check_output(
+                    'git describe --tags --abbrev=0 HEAD^', shell=True, stderr=subprocess.DEVNULL
+                ).decode().strip()
+                since = subprocess.check_output(
+                    f'git log -1 --format=%aI {prev_tag}', shell=True
+                ).decode().strip()
+            except Exception:
+                pass  # primo tag: prendi tutte le PR mergiate su main
+
+            query = f'repo:{repo} is:pr is:merged base:main'
+            if since:
+                query += f' merged:>={since}'
+
+            resp = requests.get(
+                'https://api.github.com/search/issues',
+                headers=headers,
+                params={'q': query, 'per_page': 100, 'sort': 'created', 'order': 'asc'},
+            )
+            resp.raise_for_status()
+            prs = resp.json().get('items', [])
+
+            # Cattura tutto ciò che sta sotto '## Summary by CodeRabbit' fino
+            # alla prossima intestazione di pari livello (o fine testo)
+            pattern = re.compile(
+                r'#{1,3}\s*Summary by CodeRabbit\s*\n(.*?)(?=\n#{1,3}\s|\Z)',
+                re.DOTALL | re.IGNORECASE,
+            )
+
+            sections = []
+            for pr in prs:
+                number = pr['number']
+                title = pr['title']
+                body = pr.get('body') or ''
+                match = pattern.search(body)
+                summary = match.group(1).strip() if match else '_Nessun riepilogo CodeRabbit disponibile per questa PR._'
+                sections.append(f'### #{number} — {title}\n\n{summary}')
+
+            changelog = '\n\n'.join(sections) if sections else 'Manutenzione e aggiornamenti minori.'
+
+            with open('ai_changelog.md', 'w', encoding='utf-8') as f:
+                f.write(changelog)
+            "
+
+        - name: Prepare Final Release Body
+          run: |
+            cat << 'EOF' > release_body.md
+            ## Changelog
+            
+            EOF
+            
+            cat ai_changelog.md >> release_body.md
+            
+            cat << 'EOF' >> release_body.md
+
+            ## Downloads
+            
+            [![Windows](https://img.shields.io/badge/Windows-Mornye-0078D6?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MTIiIGhlaWdodD0iNTEyIiB2aWV3Qm94PSIwIDAgMjAgMjAiPjxwYXRoIGZpbGw9IiNmZmZmZmYiIGZpbGwtcnVsZT0iZXZlbm9kZCIgZD0iTTIwIDEwLjg3M1YyMEw4LjQ3OSAxOC41MzdsLjAwMS03LjY2NEgyMFptLTEzLjEyIDBsLS4wMDEgNy40NjFMMCAxNy40NjF2LTYuNTg4aDYuODhaTTIwIDkuMjczSDguNDhsLS4wMDEtNy44MUwyMCAwdjkuMjczWk02Ljg3OSAxLjY2NmwuMDAxIDcuNjA3SDBWMi41MzlsNi44NzktLjg3M1oiLz48L3N2Zz4=)](https://github.com/${{ github.repository }}/releases/download/${{ needs.lint-and-bump.outputs.release_tag }}/Mornye-Windows.exe) [![macOS](https://img.shields.io/badge/macOS-Mornye-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/${{ github.repository }}/releases/download/${{ needs.lint-and-bump.outputs.release_tag }}/Mornye-macOS) [![Linux](https://img.shields.io/badge/Linux-Mornye-FFB300?style=for-the-badge&logo=linux&logoColor=black)](https://github.com/${{ github.repository }}/releases/download/${{ needs.lint-and-bump.outputs.release_tag }}/Mornye-Linux-x86_64)
+
+            <details>
+            <summary><b>💻 Usage Instructions</b></summary>
+            
+            ### Windows (PowerShell or CMD)
+            ```cmd
+            Mornye-Windows.exe [https://open.spotify.com/track/](https://open.spotify.com/track/)... ./out --service tidal
+            ```
+
+            ### 🍏 macOS
+            ```bash
+            chmod +x Mornye-macOS
+            ./Mornye-macOS [https://open.spotify.com/track/](https://open.spotify.com/track/)... ./out --service tidal
+            ```
+
+            ### 🐧 Linux
+            ```bash
+            chmod +x Mornye-Linux-x86_64
+            ./Mornye-Linux-x86_64 [https://open.spotify.com/track/](https://open.spotify.com/track/)... ./out --service tidal
+            ```
+            *(For ARM devices like Raspberry Pi, replace `x86_64` with `arm64`)*
+            </details>
+            EOF
+
+        - name: Create GitHub Release
+          uses: softprops/action-gh-release@v2
+          with:
+            tag_name: ${{ needs.lint-and-bump.outputs.release_tag }}
+            files: release-files/*
+            draft: false
+            prerelease: false
+            body_path: release_body.md
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

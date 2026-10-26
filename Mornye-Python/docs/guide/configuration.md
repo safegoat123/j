@@ -1,0 +1,570 @@
+<!-- Extracted verbatim from README.md. The README had grown to 76 KB
+     and 87 headings, which is past the point where either GitHub or
+     PyPI renders it usefully. Nothing here was reworded in the split. -->
+
+[← Back to the README](../../README.md)
+
+# Advanced Configuration
+
+## Advanced Configuration
+
+You can customize the download behavior, prioritize specific installed extensions, and organize your files automatically into folders.
+
+```python
+from mornye import Mornye
+
+Mornye(
+    url="https://open.spotify.com/album/ALBUM_ID",
+    output_dir="./MusicLibrary",
+    services=["ext:qobuz-web", "ext:amazon-web", "ext:tidal-web"],
+    filename_format="{year} - {album}/{track}. {title}",
+    use_artist_subfolders=True,
+    use_album_subfolders=True,
+    loop=60,                     # retry duration in minutes
+    track_max_retries=2,         # extra per-track retries on failure
+    post_download_action="notify"
+)
+```
+
+### Lyrics Provider Health Check
+
+Mornye can probe the endpoints of the configured lyrics providers before embedding lyrics, to verify which lyric sources are currently reachable.
+
+This check is specifically about lyrics sources, not audio download providers. In Interactive Mode it runs automatically at startup. In code or scripts you can call it directly:
+
+```python
+from mornye.core.health_check import (
+    run_health_check,
+    print_health_report,
+    get_working_providers,
+)
+
+import asyncio
+from mornye.core.health_check import (
+    run_health_check,
+    print_health_report,
+    get_working_providers,
+)
+
+async def main():
+    # Lyrics providers, not audio ones: run_health_check probes the
+    # servers listed in core/health_check.py (apple, lrclib,
+    # musixmatch, spotify, deezer, genius, netease, qq, youtube,
+    # kugou, binilyrics, unison, jiosaavn). An "ext:..." id matches nothing there.
+    results = await run_health_check(["apple", "lrclib", "musixmatch"])
+    print_health_report(results)
+
+    working = get_working_providers(results)
+    print("Available providers:", working)
+
+asyncio.run(main())
+```
+
+```bash
+# CLI: check installed extensions then download
+mornye https://open.spotify.com/track/... ./out --service ext:tidal-web ext:qobuz-web
+```
+
+The health check runs in parallel with a configurable timeout (default: 5 s per endpoint) and never blocks your download if a check fails. In the GUI, the check reports provider-level availability and endpoint counts, without exposing individual raw endpoint URLs.
+
+### Lyrics Provider Order
+
+`lyrics_providers` (`--lyrics-providers`) is a **ranking**, not a set. Every provider on the list is queried at once — that is what keeps the lookup fast — but the answers are read back in the order you gave, and the first one that has lyrics wins.
+
+The order matters because the providers do not return the same thing. Apple returns *word-by-word* lyrics, timed per syllable:
+
+```
+[00:08.75]<00:08.75>Sento <00:09.05>un<00:09.22>ra-<00:09.41>ta- <00:09.90>ta
+```
+
+LRCLIB returns line-level lyrics. Put `apple` first and you get the first form wherever Apple has it, falling through to the rest where it does not — at no cost in speed, because by the time a first choice comes back empty the others have long since finished.
+
+Each provider's own answer is cached separately (7 days for a hit, 6 hours for a miss), so changing the order takes effect immediately rather than being masked by a cached result from a previous ordering.
+
+### Apple Lyrics: Word-by-Word or Line-Synced
+
+By default Apple's lyrics are kept in their native *word-by-word* form (timed per syllable, with inline `<mm:ss.xx>` tags). Set `apple_lyrics_word_by_word=False` (Python / GUI toggle) or pass `--apple-lyrics-line-synced` (CLI) to drop the per-syllable timings and keep only line-level timing:
+
+```
+# word-by-word (default)
+[00:08.75]<00:08.75>Sento <00:09.05>un<00:09.22>ra-<00:09.41>ta- <00:09.90>ta
+
+# line-synced (--apple-lyrics-line-synced)
+[00:08.75]Sento unra-ta- ta
+```
+
+Line-synced is useful for players and overlay apps that only understand line-level `.lrc`, or simply if you prefer a plain karaoke-style scroll. The setting affects only the `apple` provider; every other provider is unchanged. Apple's two renderings are cached under separate keys, so switching the setting takes effect immediately.
+
+### Lyrics Files (`.lrc`)
+
+Lyrics are written into the audio file's tag by default. That is enough for tagging, and not enough for playback: **no major player renders word-by-word lyrics out of an embedded tag.** Apple Music in particular strips the inline timing from a local file and shows flat text, and the synced lyrics it scrolls for streamed tracks come from Apple's own servers, not from the file.
+
+The synced display comes from an `.lrc` file on disk, read by a player or an overlay app. Two switches, because two kinds of player disagree about where to look:
+
+| Option | Writes |
+| --- | --- |
+| `save_lrc` / `--save-lrc` | `<audio file's name>.lrc`, next to the track |
+| `lrc_library_dir` / `--lrc-dir DIR` | `DIR/Artist - Title.lrc`, one folder for everything |
+
+The first is the convention players pair a sidecar with its track by; the second is the `Artist - Title` layout overlay apps (LyricsX and similar) look lyrics up by — note it is the *reverse* of the default `{title} - {artist}` filename format, which is why it cannot simply reuse the audio file's name.
+
+```bash
+# Both layouts at once
+mornye https://open.spotify.com/playlist/... ./out \
+    --lyrics-providers apple lrclib \
+    --save-lrc --lrc-dir ~/Music/Lyrics
+```
+
+```python
+from mornye import Mornye
+
+Mornye(
+    url="https://open.spotify.com/playlist/...",
+    output_dir="./out",
+    lyrics_providers=["apple", "lrclib"],
+    save_lrc=True,
+    lrc_library_dir="~/Music/Lyrics",
+)
+```
+
+Both are off by default. The lyrics are read back out of the finished file rather than fetched again, so there is no extra network request, it works with every provider, and the `.lrc` is by construction identical to what the track carries — including after transcoding, where the sidecar follows the converted file. A track with no lyrics produces no empty file, and a destination that cannot be written is logged as a warning rather than failing the download.
+
+### Canvas
+
+A Canvas is the 3-to-8 second silent loop that plays behind the player instead of the cover art. It belongs to the track, not the album, and most of the catalogue has none.
+
+It is saved **beside** the audio, never inside it: FLAC has no video stream to embed one in, and muxing it into an `.m4a` produces files several players refuse to open. The two switches split the same way the `.lrc` ones do:
+
+| Option | Writes |
+| --- | --- |
+| `save_canvas` / `--save-canvas` | `<audio file's name>.<ext>`, next to the track |
+| `canvas_library_dir` / `--canvas-dir DIR` | `DIR/Artist - Title.<ext>`, one folder for everything |
+
+`<ext>` is whatever Spotify serves for that track, read off the media URL: `.mp4` for the looping video most canvases are, `.jpg` for the ones that are a still image.
+
+```bash
+mornye https://open.spotify.com/album/... ./out --save-canvas
+```
+
+```python
+from mornye import Mornye
+
+Mornye(
+    url="https://open.spotify.com/album/...",
+    output_dir="./out",
+    save_canvas=True,
+    canvas_library_dir="~/Music/Canvas",
+)
+```
+
+Both are off by default, and it is worth being clear about what the file is for: **no media server picks these up on its own.** Jellyfin's music scanner only walks audio extensions, so the sidecar sits there ignored rather than turning up as a stray video item — this is for archiving the track complete and for players that know to look, not a way to get canvases to show up in a library app.
+
+`canvas_providers` / `--canvas-providers` chooses where one is looked up, in order:
+
+| Provider | Where it goes |
+| --- | --- |
+| `spotify` (default first) | Spotify's own `canvaz-cache` endpoint, behind the same anonymous token the lyrics already use. No third party involved. |
+| `paxsenix` | [Spotify-Canvas-API](https://github.com/Paxsenix0/Spotify-Canvas-API), a public JSON wrapper around that same endpoint, as a fallback for when the direct call is blocked. |
+
+Neither endpoint is documented by Spotify. A track with no canvas is remembered for a week so that re-running a discography does not cost a request per track, a failed lookup is a debug line rather than a failed download, and an existing sidecar is left alone rather than fetched again.
+
+### Animated album artwork
+
+Mornye can use the [Apple Music Animated Artworks API](https://github.com/m8tec/apple-music-animated-artworks) to find and download matching animated album art. Enable **Download animated album artwork** under **Metadata Enrichment** in the GUI or TUI, pass `--animated-artwork` on the CLI, or set `save_animated_artwork=True` in Python. The adjacent API URL field in the GUI and TUI can point to a self-hosted instance; the CLI equivalent is `--animated-artwork-api-url`:
+
+```bash
+mornye https://open.spotify.com/album/... ./out --animated-artwork \
+  --animated-artwork-api-url https://artwork.m8tec.top
+```
+
+```python
+from mornye import Mornye
+
+Mornye(
+    url="https://open.spotify.com/album/...",
+    output_dir="./out",
+    save_animated_artwork=True,
+    animated_artwork_api_url="https://artwork.m8tec.top",
+)
+```
+
+The animation is converted to `cover.webp` in the downloaded track's folder, the format used by the linked downloader and supported by Navidrome. Existing `cover.webp` files are preserved. This is an album-level image, so downloads are best organized into album folders. The feature is off by default and requires `ffmpeg`; no matching artwork or an artwork conversion failure does not fail the audio download.
+
+Set `MORNYE_ANIMATED_ARTWORKS_ENABLED=1` to enable the option by default for new configurations. Set `MORNYE_ANIMATED_ARTWORKS_API_URL` to your own API root to self-host; the default is `https://artwork.m8tec.top`. In Docker, configure these variables in Compose. See [Docker environment variables](docker.md#environment-variables).
+
+### Configuration Profiles
+
+Save and reuse complete download configurations without re-typing them every time.
+
+### Save a profile
+
+```bash
+# Save current flags as "hires-tidal"
+mornye https://... ./out \
+  --service ext:tidal-web \
+  --quality HI_RES_LOSSLESS \
+  --use-album-subfolders \
+  --filename-format "{year} - {album}/{track}. {title}" \
+  --save-profile hires-tidal
+```
+
+### Load a profile
+
+```bash
+# Load "hires-tidal" — flags override profile values when both are present
+mornye https://... ./out --profile hires-tidal
+```
+
+### In Python
+
+```python
+import asyncio
+from mornye.core.profiles import (
+    save_profile_async,
+    get_profile_async,
+    list_profiles_async,
+)
+
+async def main():
+    await save_profile_async("hires-tidal", {
+        "services":             ["ext:tidal-web"],
+        "quality":              "HI_RES_LOSSLESS",
+        "use_album_subfolders": True,
+        "filename_format":      "{year} - {album}/{track}. {title}",
+    })
+
+    cfg = await get_profile_async("hires-tidal")
+    print(await list_profiles_async())  # ['hires-tidal']
+
+asyncio.run(main())
+```
+
+Profiles are stored at `~/.cache/mornye/profiles.json`. In the Interactive Wizard, you are prompted to load a profile at startup and optionally save one at the end.
+
+### Batch Downloads
+
+Pass a list of URLs to download them all in sequence. Failed tracks per URL are collected and can be retried with `loop`.
+
+```python
+from mornye import Mornye
+
+Mornye(
+    url=[
+        "https://open.spotify.com/album/ALBUM_ID",
+        "https://open.spotify.com/playlist/PLAYLIST_ID",
+    ],
+    output_dir="./MusicLibrary",
+    services=["ext:tidal-web", "ext:qobuz-web"],
+    use_album_subfolders=True,
+)
+```
+
+### Auto-Retry on Failure
+
+Set `track_max_retries` (Python) or `--retries` (CLI) to automatically retry failed tracks. Each retry cycles through all configured extensions from the beginning, waiting exponentially longer between attempts (2 s → 4 s → 8 s …, capped at 30 s).
+
+```python
+from mornye import Mornye
+
+Mornye(
+    url="https://open.spotify.com/album/...",
+    output_dir="./downloads",
+    services=["ext:tidal-web", "ext:qobuz-web", "ext:deezer-web"],
+    track_max_retries=3,   # up to 3 extra attempts per track
+)
+```
+
+```bash
+mornye https://open.spotify.com/album/... ./out \
+  --service ext:tidal-web ext:qobuz-web ext:deezer-web \
+  --retries 3
+```
+
+> **Tip:** Combine `--retries` with `--loop` for maximum resilience — `--retries` handles transient errors on individual tracks, while `--loop` re-queues permanently failed tracks after N minutes.
+
+### Per-Track Timeout
+
+Set `timeout_s` (Python) or `--timeout` (CLI) to cap the time Mornye will spend downloading a single track. If the download does not complete within the specified number of seconds, the process is terminated and the track is marked as failed — allowing the next extension or retry to take over.
+
+```bash
+# CLI — skip any track that takes more than 3 minutes
+mornye https://open.spotify.com/album/... ./out --service ext:tidal-web --timeout 180
+```
+
+```python
+# Python API
+from mornye import Mornye
+Mornye(
+    url="https://open.spotify.com/album/...",
+    output_dir="./downloads",
+    services=["ext:tidal-web", "ext:qobuz-web"],
+    timeout_s=120,
+)
+```
+
+> **Tip:** Pair `--timeout` with `--retries` so that a stalled track is automatically re-attempted against the next extension instead of blocking the entire queue indefinitely.
+
+### Transcoding
+
+Downloads use the selected quality profile: `HI_RES_LOSSLESS` requests the best available lossless tier, while `LOSSLESS` requests standard lossless audio. Set `transcode_to` (Python) or `--transcode` (CLI) to convert every finished track to a single format of your choice. Tags, cover art and lyrics are carried over to the new file, and the original is deleted once the conversion succeeds unless `transcode_keep_original` / `--keep-original` is set.
+
+| Value | Extension | Kind | Why you'd pick it |
+| --- | --- | --- | --- |
+| `flac` | `.flac` | lossless | The universal default — read by everything except Finder previews on macOS |
+| `alac` | `.m4a` | lossless | Apple Lossless. The one lossless format macOS reads natively: Finder shows the cover art, Music.app and QuickLook just work |
+| `wavpack` | `.wv` | lossless | Compresses a little better than FLAC; narrower player support |
+| `tta` | `.tta` | lossless | True Audio — very cheap to decode, niche support |
+| `wav` | `.wav` | lossless, uncompressed | For DJ software and audio editors that want raw PCM. Roughly 1.6× the size of FLAC |
+| `aiff` | `.aiff` | lossless, uncompressed | The Apple flavour of raw PCM, same size as WAV |
+| `mp3` | `.mp3` | lossy | 320 kbps by default, for players or car stereos that cannot handle lossless files |
+
+**The lossless targets are bit-exact.** The sample rate and bit depth of the source are carried over untouched — no resampling, no requantisation — so a 24-bit/96 kHz FLAC converted to ALAC decodes back to byte-identical PCM. Only `mp3` re-encodes the audio, and only it reads `transcode_bitrate` / `--transcode-bitrate`; the lossless encoders ignore it.
+
+Converting a *lossy* source to a lossless target is allowed but logs a warning: the output is a faithful copy of an already-degraded signal, not a recovered original, and it will be several times larger.
+
+Requires `ffmpeg`. Checked upfront — before any track downloads — so you never download a whole album only to fail at the conversion step. If it's not on your `PATH`, Mornye automatically attempts to install it right there, printing progress as it goes (`core/ffmpeg_check.py`), using the same package managers and privilege rules as the Node.js auto-install described above (never escalates privileges itself); the run only fails if that attempt doesn't work out. Tidal FLAC muxing and Amazon decryption also need ffmpeg but have no such auto-install — they just fail if it's missing, same as before.
+
+```bash
+# CLI — every track ends up as a 320 kbps MP3
+mornye https://open.spotify.com/album/... ./out --service ext:tidal-web --mp3
+
+# Keep the FLAC too, and use 192 kbps instead
+mornye https://open.spotify.com/album/... ./out --mp3 --transcode-bitrate 192k --keep-original
+
+# Lossless, in a container macOS reads natively (--alac is shorthand)
+mornye https://open.spotify.com/album/... ./out --alac
+
+# Any other lossless target
+mornye https://open.spotify.com/album/... ./out --transcode wavpack
+```
+
+```python
+# Python API
+from mornye import Mornye
+Mornye(
+    url="https://open.spotify.com/album/...",
+    output_dir="./downloads",
+    services=["ext:tidal-web", "ext:qobuz-web"],
+    transcode_to="alac",          # or flac / wav / aiff / wavpack / tta / mp3
+    transcode_bitrate="320k",     # mp3 only; ignored by the lossless targets
+)
+```
+
+**Skipping already-downloaded tracks still works.** The converted file keeps the exact name the extension would have used, only with the target extension, so Mornye looks for that file *before* contacting any extension and skips the track when it is already there — no network request, no re-encode. Running the same album twice therefore costs nothing the second time. A leftover file from an earlier run in another format is converted in place instead of being re-downloaded, so an existing library converges to the chosen format in a single pass.
+
+The conversion is a no-op for extensions that already deliver the requested format, which are passed through untouched. For `alac` the *codec* is checked rather than the extension, since a lossy AAC download also lands in an `.m4a` and must not be mislabelled as lossless.
+
+### Hi-Res Verification
+
+Enable `verify_hires=True` (Python), `--verify-hires` (CLI) or **Settings → General → Quality → Verify Hi-Res authenticity** (GUI) to run a spectral-analysis QA check on every successful lossless download, flagging files that declare a high sample rate (e.g. 96 kHz) but whose actual audio content stops well short of it — a common fingerprint of **upsampling**: taking a CD-quality or lossy source and re-encoding it at a higher sample rate without adding any real high-frequency content, so it *looks* like Hi-Res without being one.
+
+```bash
+mornye https://open.spotify.com/album/... ./out --service ext:tidal-web -q HI_RES_LOSSLESS --verify-hires
+```
+
+```python
+from mornye import Mornye
+Mornye(
+    url="https://open.spotify.com/album/...",
+    output_dir="./downloads",
+    services=["ext:tidal-web"],
+    quality="HI_RES_LOSSLESS",
+    verify_hires=True,
+)
+```
+
+**How it works:** a file can claim Hi-Res along two independent axes, and each is answered by the test that can actually judge it. A short segment (default 30s) is read from the middle of the file — never the whole track, to keep memory usage bounded.
+
+| Claim | Test | Nature |
+|---|---|---|
+| **Sample rate** — declares 96 kHz | Average frequency spectrum vs. the noise floor. Content stopping just above 22.05 kHz is the fingerprint of upsampling from a CD source. | Heuristic |
+| **Bit depth** — declares 24-bit | How many bits the samples actually use. A 16-bit master padded into a 24-bit container leaves its low 8 bits zero in *every* sample. | Exact |
+
+The bit-depth test is the only one that says anything about a **24-bit / 44.1 kHz** file, which claims Hi-Res by depth alone: its sample rate claims nothing, so a CD-range spectrum is the correct answer for it rather than a finding. That case used to pass unexamined. A file is flagged if either test fails, and the warning names which one.
+
+**Formats.** FLAC, WAV, AIFF, OGG and MP3 are read directly. **ALAC (`.m4a`), WavPack (`.wv`) and TTA (`.tta`) go through ffmpeg**, because libsndfile cannot open those containers at all — and they are three of `--transcode`'s seven targets, so without that path `--transcode alac --verify-hires` looked enabled while checking nothing. If you converted your files with Mornye you already have ffmpeg; if it is missing, those three formats report an error naming ffmpeg rather than claiming the file is corrupt.
+
+**Design notes worth knowing before you turn it on:**
+
+- **Off by default, but nothing to install.** The analysis runs on `numpy` and `soundfile`, which ship with Mornye — it used to sit behind a `Mornye[hires]` extra that pulled `librosa` and, with it, numba, llvmlite, scipy and scikit-learn (~346 MB, for six functions). That extra is gone; pip treats a request for an extra that no longer exists as a warning, so an old `pip install 'Mornye[hires]'` still produces a working install.
+- **Never blocks or fails a download.** The check runs as a background task *after* the file has already been saved successfully — a track download is never delayed, retried, or marked as failed because of it, and analysis errors (corrupt segment, unreadable file, etc.) are swallowed and logged at debug level, not surfaced as errors.
+- **Every finding is graded.** Above 22 kHz an upsampled CD and a genuine master low-pass filtered in mastering (not rare in pop/rock) are the same signal, so the cutoff alone proves nothing. Each `fake_hires` verdict therefore carries a `confidence`, from evidence that *can* separate them:
+
+  | Confidence | Evidence | Replaced by `--redownload-fake-hires` |
+  |---|---|---|
+  | `certain` | An exact fingerprint: padded bit depth, every sample repeated (sample-and-hold), in-between samples on a straight line (linear interpolation), or the band above 22 kHz mirroring the audible one (imaging). | Yes |
+  | `likely` | A resampler's cliff right at 22.05 / 24 kHz (flat passband, then 40+ dB down within a few kHz) **and** an in-band noise floor, read in the quietest passages, no lower than 16-bit quantization noise. Nothing in the file exceeds what a 16-bit `LOSSLESS` copy holds. | Yes |
+  | `suspect` | Anything else that fails the cutoff test: a gradual roll-off, a floor below the 16-bit level (real resolution a 16-bit copy would lose), or music that never goes quiet enough for the floor to be read. May be a genuine master. | No — reported only |
+
+  The cliff test also catches upsamples the cutoff test used to miss: ffmpeg's default resampler leaves a flat plateau ~50 dB down above 22 kHz, which reads as "content" all the way to Nyquist.
+- **Skipped automatically for lossy output.** If `transcode_to="mp3"` (or `--mp3`) is set, the already-lossy result is never analyzed — checking an MP3 for ultrasonic content would be meaningless. The lossless targets keep the check, since they preserve the spectrum of the source exactly.
+- **Standalone tool.** The underlying checker also ships as a CLI you can point at any file(s) you already have, independent of a download run:
+
+  ```bash
+  python -m mornye.tools.hires_check_cli "My Track.flac" --seconds 45
+  ```
+
+#### Replacing a fake Hi-Res file automatically
+
+By default a finding is only a warning: the file stays where it is. Add `redownload_fake_hires=True` (Python), `--redownload-fake-hires` (CLI), or switch on **Replace fake Hi-Res** under the GUI toggle above, to act on it — a `certain` or `likely` fake is set aside, the track is downloaded again at `LOSSLESS`, and the flagged file is deleted only once the replacement is on disk. A `suspect` is only reported: it may be a genuine master, and a 16-bit copy would cost it real bit depth.
+
+```bash
+mornye https://open.spotify.com/album/... ./out --service ext:tidal-web \
+    -q HI_RES_LOSSLESS --redownload-fake-hires
+```
+
+```python
+from mornye import Mornye
+Mornye(
+    url="https://open.spotify.com/album/...",
+    output_dir="./downloads",
+    services=["ext:tidal-web"],
+    quality="HI_RES_LOSSLESS",
+    redownload_fake_hires=True,   # implies verify_hires=True
+)
+```
+
+**Why LOSSLESS is the replacement, not a downgrade.** An upsampled 24/96 file carries no more information than the CD-rate master it was made from — the extra bandwidth is empty. For a `certain` or `likely` fake the extra bit depth is empty too (padding, or a floor no lower than 16-bit noise), so the `LOSSLESS` copy is the same audio, honestly labelled, and a good deal smaller.
+
+**What to know:**
+
+- **It implies `--verify-hires`.** Replacing a file means first knowing it should be replaced, so enabling one enables the other.
+- **Only when Hi-Res was requested.** With `-q LOSSLESS`, standard-definition content is exactly what was asked for, not a finding — the check does not engage at all.
+- **The check runs inline here, not in the background.** The verdict decides what happens to the file, so the track is only reported as finished once it has been settled. Expect a few CPU-bound seconds per Hi-Res track.
+- **It can never leave you with nothing.** The flagged file is *renamed* (`<name>.fake-hires.bak`), not deleted, while the replacement is fetched. If every extension fails at `LOSSLESS`, the original name is restored and the run reports that the flagged file was kept.
+- **One replacement, never a chain.** The `LOSSLESS` pass is not itself eligible for replacement, so an extension that ignores the quality request cannot put the track in a loop.
+- **A false positive costs bit depth.** Suspect findings are reported and kept. Certain or likely findings are eligible for replacement, but can still be wrong: a real 24-bit Hi-Res file can be replaced with a 16-bit `LOSSLESS` one if the spectral evidence is misgraded, an artifact-only finding is called certain, or a likely finding is based on a misread noise floor. A finding that names the bit depth instead ("declares 24-bit but only 16 bits carry data") is not a judgement call, and replacing that file loses nothing at all. Nothing audible is lost in that case, but it is a real trade — leave the option off and read the warnings if you would rather decide track by track.
+- **`transcode_keep_original` is handled too.** With that option on, the converted file *and* the provider source kept beside it are both set aside, and both are replaced or both put back. Setting aside only the converted one would leave the source where the next provider's "already downloaded" check finds it, and the track would never actually be replaced.
+
+### Multiple Playlists in One Folder
+
+Pass `--playlist` (`-p`) once per playlist to sync several of them into a **single destination folder**. Repeat the flag as many times as you need — the last positional argument is the destination:
+
+```bash
+mornye -p https://open.spotify.com/playlist/AAA \
+          -p https://open.spotify.com/playlist/BBB \
+          -p https://open.spotify.com/playlist/CCC \
+          ./Music --service ext:tidal-web
+```
+
+- **One copy per track.** A song that appears in three of those playlists is downloaded once. Tracks are matched by ISRC (resolved automatically when the metadata lacks it), falling back to artist + title, so the same recording pulled from different playlists is recognised even when the catalogue ids differ.
+- **Nothing already on disk is downloaded again.** The destination folder is indexed before any extension is contacted, in *any* audio format — a track already there as `.m4a` is not re-fetched just because this run would produce a `.flac`.
+- **One M3U per playlist.** Each playlist gets a `<Playlist Name>.m3u8` file in the destination folder listing its own tracks, in playlist order, with paths relative to the folder — so the whole directory stays portable and can be copied to a phone or a USB stick as is. Two playlists sharing a name get `Name.m3u8` and `Name (2).m3u8`.
+- **Cheap to re-run.** Playlist files are rewritten only when their content actually changed. Running the same command again after a playlist gained a track downloads that one track and touches that one M3U file.
+
+Tracks that failed to download are left out of the playlist file, so it always lists files that really exist; they are picked up on the next run.
+
+Everything else keeps working as usual — `--mp3`, `--filename-format`, `--service`, `--retries` and friends all apply:
+
+```bash
+# Sync three playlists as 320 kbps MP3, writing classic .m3u files
+mornye -p URL1 -p URL2 -p URL3 ./Music --mp3 --m3u m3u
+```
+
+With `--mp3` a playlist entry points at the converted file, and a track already present as MP3 is skipped without any network request. Use `--m3u none` to merge the playlists into one folder without writing playlist files at all.
+
+> **Note:** avoid `--use-track-numbers` (and `{position}` in `--filename-format`) here: the number depends on the merged playlist order, so filenames would change whenever any playlist does — and previously downloaded tracks would be fetched again under the new name. Mornye warns when you do.
+
+### Watch Mode (keep syncing on an interval)
+
+Add `--watch MINUTES` to any run — a single URL, or one or more `--playlist` — to re-run the exact same sync every N minutes, forever, instead of exiting after one pass:
+
+```bash
+# Re-check this playlist every hour for new tracks
+mornye https://open.spotify.com/playlist/... ./Music --service ext:tidal-web --watch 60
+```
+
+Every download path already indexes what's on disk and skips it (by ISRC/tags for `--playlist`, by filename otherwise — see [Multiple Playlists in One Folder](#multiple-playlists-in-one-folder) above and the download flow in general), so each cycle after the first is cheap: it only fetches tracks that are actually new. Stop it with Ctrl+C.
+
+`--watch` is a different tool from `--loop`: `--loop` retries *failed* tracks for a bounded time after one session ends; `--watch` re-runs the *whole* sync indefinitely. Combine both if you want each cycle to also retry transient failures:
+
+```bash
+mornye https://open.spotify.com/album/... ./Music --watch 1440 --loop 30
+```
+
+`--watch` is saved/restored by `--save-profile`/`--profile` like any other flag. Not available in the terminal UI (`--tui`), and it does not cover Spotify's "Liked Songs" — that's a private, per-account list that would need a full Spotify login (OAuth) to read, which this project deliberately doesn't implement (see the "no-account" design goal throughout this README). Point `--watch` at a public playlist, album, or artist URL instead.
+
+### Post-Download Actions
+
+| Action | Description |
+| --- | --- |
+| `none` | Do nothing (default) |
+| `open_folder` | Open the output folder in the system file manager |
+| `notify` | Send an OS desktop notification with a summary |
+| `command` | Run a custom shell command — placeholders: `{folder}`, `{succeeded}`, `{skipped}`, `{failed}` (quote `{folder}` in your template, e.g. `'{folder}'`, to handle spaces; this does not protect against an apostrophe inside the path itself) |
+
+```python
+Mornye(url="...", output_dir="./downloads", post_download_action="open_folder")
+
+Mornye(url="...", output_dir="./downloads",
+          post_download_action="command",
+          post_download_command="rsync -av '{folder}/' user@nas:/music/")
+```
+
+```bash
+mornye https://... ./out --post-action notify
+mornye https://... ./out --post-action command --post-command "rsync -av '{folder}/' user@nas:/music/"
+```
+
+> **Note:** Wrap `{folder}` in single quotes in your command template (e.g. `'{folder}'`) to safely handle spaces and most special characters. Single quotes do not protect against an apostrophe (`'`) inside the output path itself — avoid apostrophes in `output_dir`, or escape them manually for your shell before running the command.
+
+### Discography Download
+
+Download the complete discography of an artist. Duplicate tracks (same ISRC across different releases) are automatically skipped.
+
+```python
+from mornye import Mornye
+
+Mornye(url="https://open.spotify.com/artist/ARTIST_ID", output_dir="./MusicLibrary",
+          services=["ext:qobuz-web", "ext:tidal-web"], use_album_subfolders=True,
+          filename_format="{year} - {album}/{track}. {title}")
+```
+
+```bash
+mornye https://open.spotify.com/artist/... ./MusicLibrary \
+  --service ext:tidal-web --include-featuring \
+  --use-album-subfolders --filename-format "{year} - {album}/{track}. {title}"
+```
+
+Recommended layout: `--use-album-subfolders` + `--filename-format "{year} - {album}/{track}. {title}"`.
+
+### Custom Output Path (single tracks)
+
+For single track downloads you can specify the exact file path instead of relying on `output_dir` + `filename_format`.
+
+```python
+from mornye import Mornye
+
+Mornye(
+    url="https://open.spotify.com/track/TRACK_ID",
+    output_dir="./downloads",
+    output_path="files/song.flac"
+)
+```
+
+> **Note:** `output_path` is automatically ignored when the URL points to an album, playlist, or artist/discography.
+
+### Passing Settings to an Extension (e.g. a self-hosted API instance)
+
+`qobuz_local_api_url` and `tidal_custom_api` (and equivalents you'll find documented by other extensions) are **not** built-in behaviors of the core — they are optional settings forwarded to whichever extension you have installed for that service, if that extension supports them. Whether they do anything at all, what they connect to, and what account or credentials they expect depends entirely on the specific extension's own documentation and implementation, which the maintainer of this repository does not control or vouch for.
+
+```python
+from mornye import Mornye
+
+Mornye(
+    url="https://open.spotify.com/track/TRACK_ID",
+    output_dir="./downloads",
+    services=["ext:tidal-web"],
+    tidal_custom_api="https://your-instance.example.com",
+)
+```
+
+```bash
+mornye https://open.spotify.com/track/... ./downloads \
+  --service ext:tidal-web \
+  --tidal-api "https://your-instance.example.com"
+```
+
+> **Note:** These values are also saved and restored when using `--save-profile` / `--profile`.
+
+---

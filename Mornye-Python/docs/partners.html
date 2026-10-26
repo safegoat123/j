@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Extensions — Mornye</title>
+<meta name="description" content="Build JavaScript and Python extensions for Mornye, and choose trusted registries for your own workflow.">
+<meta name="theme-color" content="#101819">
+<link rel="icon" type="image/png" sizes="192x192" href="assets/images/logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+	:root {
+		--ink:#0f1115; --panel:#1a1d24; --panel-hover:#21252e; --surface:#151820;
+		--hairline:#272b34; --accent:#7c5cff; --accent-bright:#9b82ff; --accent-dim:#6647e0;
+		--ok:#3ddc97; --text:#e9e9ee; --text-dim:#96979f; --text-faint:#55565f;
+		--display:'Sora',sans-serif; --body:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
+		--mono:'JetBrains Mono',monospace; --max-w:1080px;
+	}
+	*{margin:0;padding:0;box-sizing:border-box}
+	html{scroll-behavior:smooth;scrollbar-width:thin;scrollbar-color:#333 transparent}
+	body{font-family:var(--body);background:var(--ink);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
+	a{color:var(--accent-bright);text-decoration:none} a:hover{text-decoration:underline}
+	:focus-visible{outline:2px solid var(--accent-bright);outline-offset:3px}
+	::selection{background:var(--accent);color:#fff}
+	h1,h2,h3{font-family:var(--display);letter-spacing:-.01em;color:var(--text)}
+	code,.mono{font-family:var(--mono)}
+	.wrap{max-width:var(--max-w);margin:auto;padding:0 24px}
+
+	nav{position:fixed;top:0;left:0;right:0;z-index:10;background:rgba(15,17,21,.84);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-bottom:1px solid rgba(255,255,255,.06)}
+	.nav-inner{max-width:var(--max-w);margin:auto;position:relative;display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:62px}
+	.nav-brand{display:flex;align-items:center;gap:9px;font-family:var(--display);font-weight:700;font-size:1.02rem;color:var(--text)}
+	.nav-brand .dot{width:9px;height:9px;border-radius:3px;background:var(--accent);box-shadow:0 0 10px var(--accent);transform:rotate(45deg)}
+	.nav-links{display:flex;align-items:center;gap:24px;list-style:none}.nav-links a{color:var(--text-dim);font-size:.88rem}
+	.nav-links a:hover,.nav-links a.active{color:var(--text);text-decoration:none}.nav-divider{width:1px;height:18px;background:rgba(255,255,255,.1)}
+	.nav-gh{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:6px 12px}
+	.nav-gh:hover{background:rgba(255,255,255,.08);text-decoration:none}
+	.nav-toggle{display:none;flex-direction:column;justify-content:center;gap:5px;width:34px;height:34px;background:none;border:none;cursor:pointer;padding:0}
+	.nav-toggle span{display:block;width:20px;height:2px;background:var(--text-dim);border-radius:2px;transition:transform .2s,opacity .2s}
+	.nav-toggle[aria-expanded="true"] span:nth-child(1){transform:translateY(7px) rotate(45deg)}
+	.nav-toggle[aria-expanded="true"] span:nth-child(2){opacity:0}
+	.nav-toggle[aria-expanded="true"] span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
+	@media(max-width:760px){
+		.nav-toggle{display:flex}
+		.nav-links{display:flex;flex-direction:column;align-items:stretch;gap:0;position:absolute;top:62px;left:0;right:0;background:rgba(15,17,21,.98);backdrop-filter:blur(16px);border-bottom:1px solid rgba(255,255,255,.08);max-height:0;overflow:hidden;visibility:hidden;transition:max-height .25s ease}
+		.nav-links.open{max-height:420px;visibility:visible}
+		.nav-links li{width:100%}
+		.nav-links a,.nav-links .nav-gh{display:block;padding:14px 24px;width:100%}
+		.nav-links .nav-gh{justify-content:center;border-radius:0;border:none;background:none}
+		.nav-divider{display:none}
+	}
+
+	.hero{padding:148px 24px 70px;background:radial-gradient(ellipse at 50% 0%,rgba(124,92,255,.12),transparent 58%)}
+	.hero-inner{max-width:var(--max-w);margin:auto;text-align:center}.eyebrow{font:500 .7rem var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--accent-bright);margin-bottom:13px}
+	h1{font-size:clamp(2.1rem,5vw,3.55rem);line-height:1.08;font-weight:800;letter-spacing:-1px;margin-bottom:16px}h1 span{color:var(--accent-bright)}
+	.lede{max-width:650px;margin:auto;color:var(--text-dim);font-size:1.08rem}
+	.hero-meta{display:flex;justify-content:center;gap:9px;flex-wrap:wrap;margin-top:26px}.badge{padding:6px 14px;border:1px solid var(--hairline);border-radius:999px;background:var(--surface);color:var(--text-dim);font:500 .76rem var(--mono)}.badge b{color:var(--ok);font-weight:400}
+
+	section{padding:72px 24px}.section-inner{max-width:var(--max-w);margin:auto}.section-heading{text-align:center;margin-bottom:38px}.section-heading h2{font-size:1.7rem;margin-bottom:9px}.section-heading p{color:var(--text-dim);max-width:570px;margin:auto;font-size:.92rem}
+	.eyebrow + h2{margin-top:0}
+	.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}@media(max-width:780px){.grid{grid-template-columns:1fr}}
+	.card{background:var(--panel);border:1px solid var(--hairline);border-radius:14px;padding:25px 22px;transition:background .2s,border-color .2s;display:flex;flex-direction:column}.card:hover{background:var(--panel-hover);border-color:rgba(124,92,255,.35)}
+	.card-mark{width:40px;height:40px;display:grid;place-items:center;border-radius:10px;background:rgba(124,92,255,.14);color:var(--accent-bright);font:700 .78rem var(--mono);margin-bottom:17px}.card-mark.green{background:rgba(61,220,151,.12);color:var(--ok)}
+	.card h3{font-size:1.02rem;margin-bottom:7px}.card p{color:var(--text-dim);font-size:.87rem;line-height:1.7}.card-link{margin-top:auto;padding-top:20px;font:500 .78rem var(--mono);color:var(--accent-bright)}
+	.band{background:var(--surface);border-top:1px solid var(--hairline);border-bottom:1px solid var(--hairline)}
+	.split{display:grid;grid-template-columns:1fr 1fr;gap:40px;align-items:start}@media(max-width:760px){.split{grid-template-columns:1fr;gap:28px}}
+	.split h2{font-size:1.55rem;margin-bottom:12px}.split p{color:var(--text-dim);font-size:.9rem}.split p+p{margin-top:12px}
+	.terminal{background:var(--ink);border:1px solid var(--hairline);border-radius:12px;padding:19px 21px;font:500 .78rem/1.9 var(--mono);overflow:auto}.terminal .muted{color:var(--text-faint)}.terminal .purple{color:var(--accent-bright)}.terminal .green{color:var(--ok)}
+	.notice{display:grid;grid-template-columns:auto 1fr;gap:15px;background:var(--panel);border:1px solid rgba(124,92,255,.25);border-radius:14px;padding:21px 22px}.notice-icon{color:var(--accent-bright);font:700 1.1rem var(--mono)}.notice h3{font-size:.98rem;margin-bottom:5px}.notice p{color:var(--text-dim);font-size:.86rem}.notice code{color:var(--text);background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:.78rem}
+	footer{background:var(--surface);padding:40px 24px;text-align:center;border-top:1px solid var(--hairline)}.footer-links{display:flex;gap:22px;justify-content:center;flex-wrap:wrap;margin-bottom:16px}.footer-links a{color:var(--text-dim);font-size:.88rem}.footer-links a:hover{color:var(--text)}.footer-copy{color:var(--text-faint);font-size:.78rem}
+</style>
+<link rel="stylesheet" href="site.css?v=20261020-mornye-brand">
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<nav><div class="nav-inner">
+	<a class="nav-brand" href="index.html"><img class="brand-icon" src="assets/images/logo.png" alt="">Mornye</a>
+	<button class="nav-toggle" type="button" aria-label="Toggle menu" aria-expanded="false" aria-controls="nav-links">
+		<span></span><span></span><span></span>
+	</button>
+	<ul class="nav-links" id="nav-links">
+		<li><a href="index.html#how">How it works</a></li><li><a href="index.html#features">Features</a></li><li><a href="index.html#start">Quick start</a></li><li><a href="index.html#faq">FAQ</a></li><li><a href="downloads.html">Downloads</a></li><li><a class="active" aria-current="page" href="partners.html">Extensions</a></li><li class="nav-divider"></li>
+		<li><a class="nav-gh" href="https://github.com/mornyeapp/Mornye-Python" target="_blank" rel="noopener">GitHub →</a></li>
+	</ul>
+</div></nav>
+
+<main id="main-content">
+	<header class="hero"><div class="hero-inner">
+		<div class="eyebrow">Extend the core</div>
+		<h1>Choose what connects.<br><span>Keep control of the source.</span></h1>
+		<p class="lede">Mornye stays deliberately small: it resolves metadata, while extensions bring the services and workflows you choose to run.</p>
+		<div class="hero-meta"><span class="badge"><b>●</b> no bundled providers</span><span class="badge"><b>●</b> JavaScript + Python</span><span class="badge"><b>●</b> bring your own registry</span></div>
+	</div></header>
+
+	<section><div class="section-inner">
+		<div class="section-heading"><div class="eyebrow">Build with Mornye</div><h2>Made to connect</h2><p>Extend Mornye with the providers and workflows you choose. Review every extension source before installing it.</p></div>
+		<div class="grid">
+			<article class="card"><div class="card-mark">JS</div><h3>JavaScript providers</h3><p>Run providers through the Node.js bridge and follow the manifest and runtime contract implemented by Mornye.</p><a class="card-link" href="guide/extensions.md">Explore extensions →</a></article>
+			<article class="card"><div class="card-mark">PY</div><h3>Python providers</h3><p>Package a Python provider with its manifest and use the documented Mornye extension API.</p><a class="card-link" href="guide/python-extensions.md">Read the guide →</a></article>
+			<article class="card"><div class="card-mark green">DEV</div><h3>Extension authors</h3><p>Publish through a registry you control, and let users review the source before installing.</p><a class="card-link" href="guide/extensions.md">Build an extension →</a></article>
+		</div>
+	</div></section>
+
+	<section class="band"><div class="section-inner"><div class="split">
+		<div><div class="eyebrow">A clear boundary</div><h2>The core does not pick sides.</h2><p>No provider, registry or third-party service is configured by default. The maintainer does not review, host or control extensions that users install.</p><p>That keeps the application useful for many workflows while leaving source selection, credentials and compliance in the hands of the person running it.</p></div>
+		<div class="terminal" aria-label="Registry configuration example"><span class="muted"># choose a registry you trust</span><br><span class="purple">export</span> MORNYE_REGISTRIES=<span class="green">"https://example.com/registry.json"</span><br><br><span class="muted"># install only what you choose</span><br>mornye URL ./out --service <span class="green">ext:your-extension</span></div>
+	</div></div></section>
+
+	<section><div class="section-inner"><div class="section-heading"><div class="eyebrow">Join the network</div><h2>Bring something useful</h2><p>There is no application process and no official provider list. Share a focused project, document its requirements, and give users enough information to make an informed choice.</p></div>
+		<div class="notice"><div class="notice-icon">↗</div><div><h3>Publishing an extension?</h3><p>Start with the <a href="https://github.com/mornyeapp/Mornye-Python/blob/main/docs/guide/python-extensions.md" target="_blank" rel="noopener">Writing a Python Extension</a> guide (or the JS extension notes), then publish your own registry URL. Use the <code>ext:</code> prefix when documenting how users should select your module.</p></div></div>
+	</div></section>
+</main>
+
+<footer><div class="footer-links"><a href="https://github.com/mornyeapp/Mornye-Python" target="_blank" rel="noopener">GitHub</a><a href="index.html">Home</a><a href="downloads.html">Downloads</a><a href="guide/extensions.md">Extension guide</a></div><div class="footer-copy">MIT Licensed · not affiliated with any streaming service</div></footer>
+<script>
+  const navToggle = document.querySelector('.nav-toggle');
+  const navLinks = document.getElementById('nav-links');
+  if (navToggle && navLinks) {
+    navToggle.addEventListener('click', () => {
+      const open = navLinks.classList.toggle('open');
+      navToggle.setAttribute('aria-expanded', String(open));
+    });
+    navLinks.querySelectorAll('a').forEach(a => a.addEventListener('click', () => {
+      navLinks.classList.remove('open');
+      navToggle.setAttribute('aria-expanded', 'false');
+    }));
+  }
+</script>
+</body>
+</html>

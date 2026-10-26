@@ -1,0 +1,14 @@
+# Vinyl - Spotify Record Player
+# https://vinyl.pranavkarra.me
+
+User-agent: *
+Allow: /
+
+# Disallow authenticated Spotify flows and API routes
+Disallow: /api/
+
+# Sitemap
+Sitemap: https://vinyl.pranavkarra.me/sitemap.xml
+
+# LLMs.txt for AI discoverability
+# See: https://vinyl.pranavkarra.me/llms.txt

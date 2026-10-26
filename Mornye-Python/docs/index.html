@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mornye — metadata core and extension platform</title>
+<meta name="description" content="A Python module that resolves metadata and, through extensions you choose and install yourself, retrieves matching audio. No bundled providers, no default source.">
+<meta name="theme-color" content="#101819">
+<link rel="icon" type="image/png" sizes="192x192" href="assets/images/logo.png">
+<meta property="og:title" content="Mornye">
+<meta property="og:description" content="A Python module that resolves metadata. No bundled providers, no default source — you supply the extensions.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0f1115;
+    --panel: #1a1d24;
+    --panel-hover: #21252e;
+    --surface: #151820;
+    --hairline: #272b34;
+    --accent: #7c5cff;
+    --accent-bright: #9b82ff;
+    --accent-dim: #6647e0;
+    --ok: #3ddc97;
+    --text: #e9e9ee;
+    --text-dim: #96979f;
+    --text-faint: #55565f;
+    --display: 'Sora', sans-serif;
+    --body: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: 'JetBrains Mono', monospace;
+    --max-w: 1080px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: #333 transparent; }
+  html::-webkit-scrollbar { width: 8px; }
+  html::-webkit-scrollbar-track { background: transparent; }
+  html::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+
+  body {
+    font-family: var(--body);
+    background: var(--ink); color: var(--text); line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-bright); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  :focus-visible { outline: 2px solid var(--accent-bright); outline-offset: 3px; }
+  ::selection { background: var(--accent); color: #fff; }
+  code, .mono { font-family: var(--mono); }
+  h1, h2, h3 { font-family: var(--display); letter-spacing: -0.01em; color: var(--text); }
+
+  .wrap { max-width: var(--max-w); margin: auto; padding: 0 24px; }
+
+  /* ── NAV ── */
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: rgba(15,17,21,.82); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+    border-bottom: 1px solid rgba(255,255,255,.06);
+  }
+  .nav-inner { max-width: var(--max-w); margin: auto; position: relative; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; height: 62px; }
+  .nav-brand { display: flex; align-items: center; gap: 9px; font-family: var(--display); font-weight: 700; font-size: 1.02rem; color: var(--text); }
+  .nav-brand .dot { width: 9px; height: 9px; border-radius: 3px; background: var(--accent); box-shadow: 0 0 10px var(--accent); transform: rotate(45deg); }
+  .nav-links { display: flex; align-items: center; gap: 24px; list-style: none; }
+  .nav-links a { color: var(--text-dim); font-size: .88rem; }
+  .nav-links a:hover, .nav-links a.active { color: var(--text); text-decoration: none; }
+  .nav-links .nav-divider { width: 1px; height: 18px; background: rgba(255,255,255,.1); }
+  .nav-gh {
+    display: flex; align-items: center; gap: 6px;
+    background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
+    border-radius: 8px; padding: 6px 12px; color: var(--text-dim); font-size: .82rem;
+    transition: color .2s, border-color .2s, background .2s;
+  }
+  .nav-gh:hover { color: var(--text); border-color: rgba(255,255,255,.22); background: rgba(255,255,255,.08); text-decoration: none; }
+  .nav-toggle { display: none; flex-direction: column; justify-content: center; gap: 5px; width: 34px; height: 34px; background: none; border: none; cursor: pointer; padding: 0; }
+  .nav-toggle span { display: block; width: 20px; height: 2px; background: var(--text-dim); border-radius: 2px; transition: transform .2s, opacity .2s; }
+  .nav-toggle[aria-expanded="true"] span:nth-child(1) { transform: translateY(7px) rotate(45deg); }
+  .nav-toggle[aria-expanded="true"] span:nth-child(2) { opacity: 0; }
+  .nav-toggle[aria-expanded="true"] span:nth-child(3) { transform: translateY(-7px) rotate(-45deg); }
+  @media (max-width: 760px) {
+    .nav-toggle { display: flex; }
+    .nav-links {
+      display: flex; flex-direction: column; align-items: stretch; gap: 0;
+      position: absolute; top: 62px; left: 0; right: 0;
+      background: rgba(15,17,21,.98); backdrop-filter: blur(16px);
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      max-height: 0; overflow: hidden; visibility: hidden;
+      transition: max-height .25s ease;
+    }
+    .nav-links.open { max-height: 420px; visibility: visible; }
+    .nav-links li { width: 100%; }
+    .nav-links a, .nav-links .nav-gh { display: block; padding: 14px 24px; width: 100%; }
+    .nav-links .nav-gh { justify-content: center; border-radius: 0; border: none; background: none; }
+    .nav-divider { display: none; }
+  }
+
+  /* ── HERO ── */
+  .hero { padding: 148px 24px 60px; text-align: center; background: radial-gradient(ellipse at 50% 0%, rgba(124,92,255,.09) 0%, transparent 55%); }
+  .hero h1 { font-size: clamp(2.1rem, 5vw, 3.4rem); font-weight: 800; letter-spacing: -1px; margin-bottom: 14px; line-height: 1.08; }
+  .hero h1 span { color: var(--accent-bright); }
+  .hero p.lede { font-size: 1.12rem; color: var(--text-dim); max-width: 560px; margin: 0 auto 8px; }
+
+  .hero-badges { display: flex; gap: 8px; justify-content: center; margin: 20px 0 30px; flex-wrap: wrap; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 15px; border-radius: 999px; font-size: .78rem; font-weight: 500; background: var(--surface); color: var(--text-dim); font-family: var(--mono); border: 1px solid var(--hairline); }
+  .badge .bd { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+
+  .hero-actions { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; margin-bottom: 20px; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 26px; border-radius: 10px; font-size: .92rem; font-weight: 600; transition: transform .15s, background .2s; cursor: pointer; border: none; }
+  .btn:hover { transform: translateY(-1px); text-decoration: none; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent-dim); }
+  .btn-secondary { background: var(--panel); color: var(--text); border: 1px solid var(--hairline); }
+  .btn-secondary:hover { background: var(--panel-hover); }
+
+  .install-line { display: inline-flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: .84rem; background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px; padding: 10px 14px; color: var(--text-dim); }
+  .install-line .prompt { color: var(--accent-bright); }
+  .install-line code { color: var(--text); }
+  .install-line button { background: none; border: none; color: var(--text-faint); cursor: pointer; font-family: var(--mono); font-size: .66rem; letter-spacing: .06em; text-transform: uppercase; padding: 4px 8px; border-radius: 6px; }
+  .install-line button:hover { color: var(--accent-bright); background: rgba(255,255,255,.05); }
+
+  /* ── Patch bay ── */
+  .hero-visual { display: flex; justify-content: center; margin-top: 48px; }
+  .patchbay { background: var(--panel); border: 1px solid var(--hairline); border-radius: 16px; padding: 24px 22px 20px; max-width: 400px; width: 100%; box-shadow: 0 24px 60px rgba(0,0,0,.35); }
+  .patchbay-label { font-family: var(--mono); font-size: .66rem; color: var(--text-faint); letter-spacing: .1em; text-transform: uppercase; margin-bottom: 14px; display: flex; justify-content: space-between; }
+  .patchbay svg { width: 100%; height: auto; display: block; }
+  .jack-node circle.ring { fill: none; stroke: #333; stroke-width: 1.5; }
+  .jack-node circle.hole { fill: var(--ink); }
+  .jack-node.core circle.ring { stroke: var(--accent); }
+  .jack-node.core circle.hole { fill: #1c1730; }
+  .jack-node.filled circle.ring { stroke: var(--ok); }
+  .jack-node.filled circle.hole { fill: #102420; }
+  .cable { fill: none; stroke: var(--accent); stroke-width: 1.6; opacity: .5; stroke-dasharray: 3 4; }
+  .cable.solid { stroke-dasharray: none; stroke: var(--ok); opacity: .9; }
+  .node-text { font-family: var(--mono); font-size: 9.5px; fill: var(--text-faint); }
+  .node-text.strong { fill: var(--text); }
+  .pulse { animation: pulse 2.6s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } html { scroll-behavior: auto; } }
+
+  /* ── SECTIONS ── */
+  section { padding: 76px 24px; }
+  .section-inner { max-width: var(--max-w); margin: auto; }
+  .section-title { font-size: 1.7rem; font-weight: 700; text-align: center; margin-bottom: 12px; letter-spacing: -.5px; }
+  .section-sub { text-align: center; color: var(--text-dim); max-width: 560px; margin: 0 auto 44px; }
+  .eyebrow { font-family: var(--mono); font-size: .7rem; letter-spacing: .12em; text-transform: uppercase; color: var(--accent-bright); text-align: center; margin-bottom: 10px; }
+
+  /* ── How it works ── */
+  .flow-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  @media (max-width: 780px) { .flow-grid { grid-template-columns: 1fr; } }
+  .flow-card { background: var(--panel); border: 1px solid var(--hairline); border-radius: 14px; padding: 24px 22px; transition: background .2s; }
+  .flow-card:hover { background: var(--panel-hover); }
+  .flow-card .num { display: inline-flex; align-items: center; justify-content: center; width: 25px; height: 25px; border-radius: 7px; background: rgba(124,92,255,.14); color: var(--accent-bright); font-family: var(--mono); font-size: .72rem; font-weight: 700; margin-bottom: 13px; }
+  .flow-card.you .num { background: rgba(61,220,151,.14); color: var(--ok); }
+  .flow-card h3 { font-size: 1.02rem; margin-bottom: 6px; }
+  .flow-card p { color: var(--text-dim); font-size: .88rem; }
+
+  /* ── Features ── */
+  .features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; }
+  .feature-card { background: var(--panel); border: 1px solid var(--hairline); border-radius: 14px; padding: 26px 22px; transition: background .2s; }
+  .feature-card:hover { background: var(--panel-hover); }
+  .feature-icon { width: 38px; height: 38px; border-radius: 10px; background: rgba(124,92,255,.14); color: var(--accent-bright); display: flex; align-items: center; justify-content: center; margin-bottom: 15px; font-family: var(--mono); font-size: .74rem; font-weight: 700; }
+  .feature-card h3 { font-size: 1.02rem; margin-bottom: 6px; }
+  .feature-card p { color: var(--text-dim); font-size: .88rem; }
+
+  /* ── Quick start / tabs ── */
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; justify-content: center; }
+  .tab { font-family: var(--mono); font-size: .78rem; padding: 9px 17px; background: var(--surface); color: var(--text-dim); cursor: pointer; border-radius: 999px; border: 1px solid var(--hairline); transition: background .2s, color .2s; }
+  .tab.active { background: var(--accent); color: #fff; border-color: transparent; }
+  .tab-panels { background: var(--panel); border: 1px solid var(--hairline); border-radius: 14px; padding: 4px; }
+  .tab-panel { display: none; padding: 22px 24px; }
+  .tab-panel.active { display: block; }
+  pre { font-family: var(--mono); font-size: .8rem; color: var(--text); overflow-x: auto; line-height: 1.75; }
+  pre .c { color: var(--text-faint); }
+  pre .k { color: var(--accent-bright); }
+  pre .s { color: var(--ok); }
+
+  .callout { display: grid; grid-template-columns: auto 1fr; gap: 16px; background: var(--surface); border-radius: 14px; padding: 20px 22px; margin-top: 24px; border: 1px solid rgba(124,92,255,.2); }
+  .callout .icon { width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0; background: rgba(124,92,255,.16); color: var(--accent-bright); display: flex; align-items: center; justify-content: center; font-size: .95rem; font-weight: 700; }
+  .callout h4 { font-size: .95rem; margin-bottom: 6px; }
+  .callout p { color: var(--text-dim); font-size: .86rem; }
+  .callout code { background: rgba(255,255,255,.06); padding: 1px 6px; border-radius: 4px; font-size: .78rem; }
+
+  /* ── FAQ ── */
+  .faq-list { max-width: 700px; margin: auto; display: flex; flex-direction: column; gap: 8px; }
+  .faq-item { background: var(--panel); border: 1px solid var(--hairline); border-radius: 12px; }
+  .faq-item summary { cursor: pointer; font-weight: 600; font-size: .96rem; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 17px 19px; }
+  .faq-item summary::-webkit-details-marker { display: none; }
+  .faq-item summary::after { content: "+"; font-size: 1.3rem; color: var(--text-dim); flex-shrink: 0; }
+  .faq-item[open] summary::after { content: "\2212"; }
+  .faq-item .faq-answer { padding: 0 19px 17px; color: var(--text-dim); font-size: .9rem; line-height: 1.75; }
+
+  /* ── Disclaimer ── */
+  .disclaimer { background: var(--surface); border: 1px solid var(--hairline); border-radius: 16px; padding: 30px 26px; }
+  .disclaimer h2 { font-size: 1.25rem; margin-bottom: 14px; }
+  .disclaimer p, .disclaimer li { color: var(--text-dim); font-size: .88rem; }
+  .disclaimer ul { margin: 12px 0 12px 20px; }
+  .disclaimer li { margin-bottom: 6px; }
+  .disclaimer .more { margin-top: 16px; font-family: var(--mono); font-size: .78rem; }
+
+  /* ── FOOTER ── */
+  footer { background: var(--surface); padding: 40px 24px; text-align: center; border-top: 1px solid var(--hairline); }
+  .footer-inner { max-width: var(--max-w); margin: auto; }
+  .footer-links { display: flex; gap: 22px; justify-content: center; flex-wrap: wrap; margin-bottom: 16px; }
+  .footer-links a { color: var(--text-dim); font-size: .88rem; }
+  .footer-links a:hover { color: var(--text); }
+  .footer-copy { color: var(--text-faint); font-size: .78rem; }
+</style>
+<link rel="stylesheet" href="site.css?v=20261020-mornye-brand">
+</head>
+<body>
+
+<a class="skip-link" href="#main-content">Skip to content</a>
+<nav>
+  <div class="nav-inner">
+    <a class="nav-brand" href="index.html"><img class="brand-icon" src="assets/images/logo.png" alt="">Mornye</a>
+    <button class="nav-toggle" type="button" aria-label="Toggle menu" aria-expanded="false" aria-controls="nav-links">
+      <span></span><span></span><span></span>
+    </button>
+    <ul class="nav-links" id="nav-links">
+      <li><a href="index.html#how">How it works</a></li>
+      <li><a href="index.html#features">Features</a></li>
+      <li><a href="index.html#start">Quick start</a></li>
+      <li><a href="index.html#faq">FAQ</a></li>
+      <li><a href="downloads.html">Downloads</a></li>
+      <li><a href="partners.html">Extensions</a></li>
+      <li class="nav-divider"></li>
+      <li><a class="nav-gh" href="https://github.com/mornyeapp/Mornye-Python" target="_blank" rel="noopener">GitHub →</a></li>
+    </ul>
+  </div>
+</nav>
+
+<main id="main-content">
+
+  <section class="hero">
+    <img class="hero-brand-mark" src="assets/images/logo-transparent.png" alt="Mornye logo">
+    <h1>A focused core.<br><span>Your choice of extensions.</span></h1>
+    <p class="lede">Mornye resolves track, album and playlist metadata. It ships with no bundled provider and no default extension source — every audio backend is a module you find, review, and plug in yourself.</p>
+
+    <div class="hero-badges">
+      <span class="badge"><span class="bd"></span>Python module</span>
+      <span class="badge"><span class="bd"></span>Python 3.11+</span>
+      <span class="badge"><span class="bd"></span>MIT licensed</span>
+    </div>
+
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="https://github.com/mornyeapp/Mornye-Python" target="_blank" rel="noopener">View on GitHub</a>
+      <a class="btn btn-secondary" href="downloads.html">Downloads</a>
+    </div>
+
+    <div class="install-line">
+      <span class="prompt">$</span>
+      <code>pip install mornye</code>
+      <button type="button" data-copy="pip install mornye">copy</button>
+    </div>
+
+    <div class="hero-visual">
+      <div class="patchbay">
+        <div class="patchbay-label"><span>core.socket()</span><span id="pulse-label">awaiting connection</span></div>
+        <svg viewBox="0 0 320 220" role="img" aria-label="Diagram: a core module in the center, with unfilled sockets for extensions the user has not yet connected, and one filled socket showing an extension the user has installed.">
+          <path class="cable" d="M160,110 L70,50" />
+          <path class="cable" d="M160,110 L70,110" />
+          <path class="cable solid pulse" d="M160,110 L70,170" />
+          <path class="cable" d="M160,110 L250,50" />
+          <path class="cable" d="M160,110 L250,170" />
+
+          <g class="jack-node core">
+            <circle class="ring" cx="160" cy="110" r="26" />
+            <circle class="hole" cx="160" cy="110" r="10" />
+          </g>
+          <text class="node-text strong" x="160" y="152" text-anchor="middle">CORE</text>
+          <text class="node-text" x="160" y="163" text-anchor="middle">metadata only</text>
+
+          <g class="jack-node"><circle class="ring" cx="70" cy="50" r="15" /><circle class="hole" cx="70" cy="50" r="6" /></g>
+          <text class="node-text" x="70" y="30" text-anchor="middle">tidal-web</text>
+
+          <g class="jack-node"><circle class="ring" cx="70" cy="110" r="15" /><circle class="hole" cx="70" cy="110" r="6" /></g>
+          <text class="node-text" x="70" y="132" text-anchor="middle">— empty —</text>
+
+          <g class="jack-node"><circle class="ring" cx="250" cy="50" r="15" /><circle class="hole" cx="250" cy="50" r="6" /></g>
+          <text class="node-text" x="250" y="30" text-anchor="middle">— empty —</text>
+
+          <g class="jack-node"><circle class="ring" cx="250" cy="170" r="15" /><circle class="hole" cx="250" cy="170" r="6" /></g>
+          <text class="node-text" x="250" y="192" text-anchor="middle">— empty —</text>
+
+          <g class="jack-node filled"><circle class="ring pulse" cx="70" cy="170" r="15" /><circle class="hole" cx="70" cy="170" r="6" /></g>
+          <text class="node-text strong" x="70" y="192" text-anchor="middle">your-ext.py</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="section-inner">
+      <div class="eyebrow">How it works</div>
+      <h2 class="section-title">Three sockets, in order</h2>
+      <p class="section-sub">Nothing about the audio backend is decided for you. The core resolves what a URL means; getting the actual audio is a separate, opt-in step.</p>
+      <div class="flow-grid">
+        <div class="flow-card">
+          <div class="num">01</div>
+          <h3>Resolve the URL</h3>
+          <p>Paste a track, album, playlist or artist link. The core resolves title, artist, album, and other metadata. No audio yet.</p>
+        </div>
+        <div class="flow-card you">
+          <div class="num">02</div>
+          <h3>Point at a registry</h3>
+          <p>Set <code class="mono">MORNYE_REGISTRIES</code>, or add one from Settings if you're using the GUI/web interface, to a source of extensions you've chosen. Nothing is fetched until you do.</p>
+        </div>
+        <div class="flow-card">
+          <div class="num">03</div>
+          <h3>Retrieve audio</h3>
+          <p>An installed extension (JavaScript or Python) handles the actual provider. The core never talks to a provider directly.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="section-inner">
+      <div class="eyebrow">Features</div>
+      <h2 class="section-title">What the core actually does</h2>
+      <p class="section-sub">&nbsp;</p>
+      <div class="features-grid">
+        <div class="feature-card"><div class="feature-icon">API</div><h3>Sync &amp; async Python</h3><p>A blocking <code class="mono">Mornye()</code> call for scripts, or <code class="mono">AsyncMornye</code> for bots and web backends.</p></div>
+        <div class="feature-card"><div class="feature-icon">＋</div><h3>JS or Python extensions</h3><p>Bring your own registry. Nothing bundled, nothing installed automatically, ever.</p></div>
+        <div class="feature-card"><div class="feature-icon">◧</div><h3>CLI, GUI, web, terminal</h3><p><code class="mono">--gui</code> for a native window, <code class="mono">--web</code> for the same interface in a browser, <code class="mono">--tui</code> for a guided terminal UI.</p></div>
+        <div class="feature-card"><div class="feature-icon">♫</div><h3>MusicBrainz enrichment</h3><p>Genre, label, BPM, UPC and ISRC tags added automatically when a match is found.</p></div>
+        <div class="feature-card"><div class="feature-icon">Aa</div><h3>Synced lyrics embedding</h3><p>Optional, multi-provider, embedded directly into the file's tags.</p></div>
+        <div class="feature-card"><div class="feature-icon">⟳</div><h3>Local retagger</h3><p>The GUI rescans and fixes tags on files you already have, with automatic backup before writing.</p></div>
+        <div class="feature-card"><div class="feature-icon">∞</div><h3>Watch mode</h3><p><code class="mono">--watch</code> re-syncs a playlist, album, or artist on an interval, indefinitely — only what's new gets fetched.</p></div>
+        <div class="feature-card"><div class="feature-icon">≈</div><h3>Duplicate detection</h3><p>Finds the same recording across your library by acoustic fingerprint, independent of tags or ISRC.</p></div>
+        <div class="feature-card"><div class="feature-icon">✓</div><h3>Discovery &amp; signed registries</h3><p>Browse community registries before adding one, and verify Ed25519-signed extension entries on top of the usual checksum.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="section-inner">
+      <div class="eyebrow">Quick start</div>
+      <h2 class="section-title">Pick an interface</h2>
+      <p class="section-sub">All talk to the same core. None can retrieve audio until you've installed at least one extension — see below.</p>
+
+      <div class="tabs" role="tablist">
+        <div class="tab active" role="tab" data-tab="cli">CLI</div>
+        <div class="tab" role="tab" data-tab="gui">GUI</div>
+        <div class="tab" role="tab" data-tab="web">Web</div>
+        <div class="tab" role="tab" data-tab="py">Python</div>
+      </div>
+      <div class="tab-panels">
+        <div class="tab-panel active" data-panel="cli"><pre><span class="c"># clone and install</span>
+pip install mornye
+
+<span class="c"># point at a registry you've chosen, then install an extension</span>
+<span class="k">export</span> MORNYE_REGISTRIES=<span class="s">"https://example.com/my-registry.json"</span>
+
+<span class="c"># resolve + download using an installed extension</span>
+mornye https://open.spotify.com/track/TRACK_ID ./downloads --service ext:tidal-web</pre></div>
+        <div class="tab-panel" data-panel="gui"><pre><span class="c"># native window</span>
+mornye --gui</pre></div>
+        <div class="tab-panel" data-panel="web"><pre><span class="c"># same interface, served locally — open http://127.0.0.1:8000</span>
+mornye --web</pre></div>
+        <div class="tab-panel" data-panel="py"><pre><span class="k">from</span> mornye <span class="k">import</span> Mornye
+
+Mornye(
+    url=<span class="s">"https://open.spotify.com/track/TRACK_ID"</span>,
+    output_dir=<span class="s">"./downloads"</span>,
+    services=[<span class="s">"ext:tidal-web"</span>],  <span class="c"># requires the extension to be installed</span>
+)</pre></div>
+      </div>
+
+      <div class="callout">
+        <div class="icon">＋</div>
+        <div>
+          <h4>About that <code>ext:tidal-web</code></h4>
+          <p>It only resolves to something if you've installed an extension by that name, from a registry you configured. The maintainer doesn't ship, curate, or default to one — see <a href="https://github.com/mornyeapp/Mornye-Python#extensions" target="_blank" rel="noopener">Extensions</a> in the README for the full mechanism.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="faq">
+    <div class="section-inner">
+      <div class="eyebrow">FAQ</div>
+      <h2 class="section-title">Common questions</h2>
+      <p class="section-sub">&nbsp;</p>
+      <div class="faq-list">
+        <details class="faq-item">
+          <summary>Why doesn't anything download right after I install it?</summary>
+          <div class="faq-answer">By design. The core resolves metadata only — it has no built-in provider and no default extension source. You need to point <code class="mono">MORNYE_REGISTRIES</code> at a registry of your choosing and install at least one extension before it can retrieve audio.</div>
+        </details>
+        <details class="faq-item">
+          <summary>Can I write my own extension?</summary>
+          <div class="faq-answer">Yes — JavaScript and Python are both supported. <code class="mono">mornye --ext-scaffold NAME</code> generates a working starting point for either, and <code class="mono">mornye --ext-dry-run PATH</code> validates it (manifest, entry point, exposes the right shape) without installing it or contacting any registry. For Python there's a full walkthrough — the <code class="mono">BaseProvider</code> contract, the <code class="mono">core</code> toolbox, a complete example provider, packaging and publishing: see <a href="https://github.com/mornyeapp/Mornye-Python/blob/main/docs/guide/python-extensions.md" target="_blank" rel="noopener">Writing a Python Extension</a>.</div>
+        </details>
+        <details class="faq-item">
+          <summary>GUI or web mode — which should I use?</summary>
+          <div class="faq-answer"><code class="mono">--gui</code> opens a native window. <code class="mono">--web</code> serves the identical interface as a local web server instead, useful on headless machines or inside Docker. Web mode binds to <code class="mono">127.0.0.1</code> by default — changing that exposes it to anything that can reach the port, unless you also set <code class="mono">--web-token</code> (a shared secret) or <code class="mono">--web-multiuser</code> (per-account login).</div>
+        </details>
+        <details class="faq-item">
+          <summary>Does the maintainer review third-party extensions or registries?</summary>
+          <div class="faq-answer">No. Extensions are found, chosen, and installed entirely by you. The maintainer doesn't review, endorse, or take responsibility for what a third-party extension or registry does — treat installing one with the same care you'd apply to any other third-party code.</div>
+        </details>
+        <details class="faq-item">
+          <summary>Is this legal to use?</summary>
+          <div class="faq-answer">Mornye's core doesn't host, store, or distribute copyrighted content — it resolves metadata. What happens when you install and use a third-party extension is between you and the terms of service of whatever platform that extension talks to. See the <a href="https://github.com/mornyeapp/Mornye-Python#disclaimer" target="_blank" rel="noopener">full disclaimer</a> for specifics; this isn't legal advice.</div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section id="disclaimer">
+    <div class="section-inner">
+      <div class="disclaimer">
+        <h2>Disclaimer</h2>
+        <p>This project is an independent tool and is not affiliated with, endorsed by, or connected to Spotify, Tidal, Qobuz, Amazon Music, Deezer, or any other streaming service.</p>
+        <ul>
+          <li>No copyrighted content is hosted, stored, mirrored, or distributed by this project. The core does not bundle, ship, or default to any third-party extension, registry, or provider.</li>
+          <li>You are responsible for ensuring your use of this software, and any extension or registry you choose to install, complies with your local laws and the terms of service of any platform you access.</li>
+          <li>The maintainer does not review, endorse, or take responsibility for the content or behavior of third-party extensions or registries a user may choose to install.</li>
+        </ul>
+        <div class="more">Full disclaimer, license and details → <a href="https://github.com/mornyeapp/Mornye-Python#disclaimer" target="_blank" rel="noopener">github.com/mornyeapp/Mornye-Python</a></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="footer-inner">
+    <div class="footer-links">
+      <a href="https://github.com/mornyeapp/Mornye-Python" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://ko-fi.com/bartolomeorusso9" target="_blank" rel="noopener">Ko-fi</a>
+      <a href="downloads.html">Downloads</a>
+      <a href="partners.html">Extensions</a>
+      <a href="https://github.com/mornyeapp/Mornye-Python/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+      <a href="https://github.com/mornyeapp/Mornye-Python/issues" target="_blank" rel="noopener">Issues</a>
+    </div>
+    <div class="footer-copy">MIT Licensed · not affiliated with any streaming service</div>
+  </div>
+</footer>
+
+<script>
+  const navToggle = document.querySelector('.nav-toggle');
+  const navLinks = document.getElementById('nav-links');
+  if (navToggle && navLinks) {
+    navToggle.addEventListener('click', () => {
+      const open = navLinks.classList.toggle('open');
+      navToggle.setAttribute('aria-expanded', String(open));
+    });
+    navLinks.querySelectorAll('a').forEach(a => a.addEventListener('click', () => {
+      navLinks.classList.remove('open');
+      navToggle.setAttribute('aria-expanded', 'false');
+    }));
+  }
+
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      tab.classList.add('active');
+      document.querySelector('.tab-panel[data-panel="' + tab.dataset.tab + '"]').classList.add('active');
+    });
+  });
+
+  document.querySelectorAll('[data-copy]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copy);
+        const original = btn.textContent;
+        btn.textContent = 'copied';
+        setTimeout(() => { btn.textContent = original; }, 1400);
+      } catch (e) {}
+    });
+  });
+
+  const label = document.getElementById('pulse-label');
+  const states = ['awaiting connection', '1 module connected'];
+  let i = 1;
+  setInterval(() => {
+    i = (i + 1) % states.length;
+    if (label) label.textContent = states[i];
+  }, 3200);
+</script>
+
+</body>
+</html>

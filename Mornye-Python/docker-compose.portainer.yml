@@ -1,0 +1,264 @@
+# ==============================================================================
+# Mornye — Portainer stack (web mode) + Watchtower auto-update
+# ==============================================================================
+# Deploy: Portainer > Stacks > Add stack > Web editor, paste this file, then
+# fill the values below under "Environment variables" (or leave them empty —
+# every one of them has a safe default except MORNYE_REGISTRIES).
+#
+# Unlike docker-compose.example.yml this file never builds from source:
+# a Portainer stack has no build context, so it pulls the published GHCR
+# image — which is also what makes Watchtower's auto-update meaningful.
+#
+# Only MORNYE_REGISTRIES is genuinely required: no extension registry is
+# bundled by design, and without one there are no providers to download with.
+# ==============================================================================
+
+# Keep the established project name so Compose resolves this deployment's
+# existing named volumes. Set COMPOSE_PROJECT_NAME to the value used by your
+# current stack if you customized it.
+name: ${COMPOSE_PROJECT_NAME:-mornye-module-version}
+
+services:
+  mornye:
+    image: ghcr.io/mornyeapp/mornye-python:${MORNYE_TAG:-latest}
+    container_name: mornye
+    # --host 0.0.0.0 is mandatory in a container: the CLI default 127.0.0.1
+    # only accepts connections from inside the container itself.
+    command: ["--web", "--host", "0.0.0.0", "--port", "8000"]
+    # For per-user logins instead of one shared token, use:
+    # command: ["--web", "--host", "0.0.0.0", "--port", "8000", "--web-multiuser"]
+    # (create users first: docker exec mornye mornye --web-user-add NAME PASS)
+
+    # Who the container runs as: set PUID / PGID in the stack's environment
+    # variables. No root is involved. With the named volumes below this only
+    # works for the default 1000:1000 (that is who owns a fresh volume); for
+    # any other UID — or a bind mount that UID cannot write yet — use the
+    # root-assisted variant: `user: "0:0"` here, plus the PUID/PGID lines
+    # under `environment`. The entrypoint then chowns the data directories
+    # and drops to PUID:PGID before anything else runs.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      # Host side is 8080, not 8000: on a Portainer host 8000 is taken by
+      # Portainer itself (the Edge agent tunnel server). Container side stays
+      # 8000 and must match --port in `command` and the healthcheck below.
+      - "${MORNYE_PORT:-8080}:8000"
+
+    # The web path skips Xvfb/VNC, but a download can still hit a Turnstile
+    # challenge, and the solver then launches a real Chromium on its own
+    # display. Chromium dies on the default 64 MB /dev/shm.
+    shm_size: "1gb"
+
+    # The container's resolver proved unreliable in practice: extensions hit
+    # "Temporary failure in name resolution" and "Name or service not known",
+    # and core/http.py's DNS-over-HTTPS fallback only covers the requests that
+    # go through it — a Node extension's own HTTP client does not.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
+    environment:
+      # --- Extensions ------------------------------------------------------
+      # REQUIRED. Comma-separated registry JSON URLs. Nothing is bundled.
+      MORNYE_REGISTRIES: "${MORNYE_REGISTRIES:-}"
+      # Optional: directory JSONs that *list* registries for you to review and
+      # add yourself (GUI > Discover). Not a source of extensions on its own.
+      MORNYE_REGISTRY_DIRECTORIES: "${MORNYE_REGISTRY_DIRECTORIES:-}"
+      # Optional: path to a file of extension download URLs, one per line.
+      MORNYE_EXT_LINKS: "${MORNYE_EXT_LINKS:-}"
+      # Minimum trust tier accepted on install: unverified | checksum-only | signed
+      MORNYE_MIN_TRUST: "${MORNYE_MIN_TRUST:-}"
+      # Seconds between checks for newer extension versions while the
+      # container keeps running (default 3600; 0 = only at container start).
+      # Watchtower only recreates the container for a new image, so this is
+      # what brings extension updates in between.
+      MORNYE_EXT_UPDATE_INTERVAL: "${MORNYE_EXT_UPDATE_INTERVAL:-}"
+
+      # --- Web GUI authentication -----------------------------------------
+      # Required, not optional: `:?` makes the deploy fail with this message
+      # rather than quietly starting an unauthenticated GUI on a port that is
+      # published to the whole LAN. Set it in the stack's environment
+      # variables to any long random string.
+      #
+      # /healthz stays exempt from the check inside the app (webapp.py), so
+      # enabling this does not make the container report itself unhealthy.
+      MORNYE_WEB_TOKEN: "${MORNYE_WEB_TOKEN:?set a long random shared secret — the web GUI has no other authentication}"
+
+      # --- Identity (root-assisted variant only, see `user:` above) --------
+      # PUID: "${PUID:-1000}"
+      # PGID: "${PGID:-1000}"
+
+      # --- Storage ---------------------------------------------------------
+      # All container paths; each must be (inside) a volume mounted below.
+      #
+      # Where --web saves music. Unset, that is ~/Music/Mornye — inside
+      # the container's writable layer, gone at the next recreate.
+      MORNYE_DOWNLOAD_DIR: "${MORNYE_DOWNLOAD_DIR:-/app/downloads}"
+      # Database, extensions, signed sessions, web users, trusted keys,
+      # settings. Independent of $HOME, so it holds for any `user:`.
+      MORNYE_DATA_DIR: "${MORNYE_DATA_DIR:-/home/mornye/.mornye}"
+      MORNYE_EXT_DIR: "${MORNYE_EXT_DIR:-}"
+      # Both default inside MORNYE_DATA_DIR — override only if you want
+      # the database or the (regenerable) cache somewhere else.
+      MORNYE_DB_PATH: "${MORNYE_DB_PATH:-}"
+      MORNYE_CACHE_DIR: "${MORNYE_CACHE_DIR:-}"
+
+      # --- Animated Apple Music album artwork (optional) ------------------
+      # Set to 1 to enable by default. The Metadata Enrichment setting can
+      # still be changed per saved configuration.
+      MORNYE_ANIMATED_ARTWORKS_ENABLED: "${MORNYE_ANIMATED_ARTWORKS_ENABLED:-0}"
+      # Public API by default; set this to your own API's root URL if hosted.
+      MORNYE_ANIMATED_ARTWORKS_API_URL: "${MORNYE_ANIMATED_ARTWORKS_API_URL:-https://artwork.m8tec.top}"
+
+      # --- Browser (Turnstile solver) --------------------------------------
+      # How many Chromium instances may run at once (default 3). Each is a
+      # few hundred MB of RAM while it lives; lower it on a small host.
+      TS_MAX_CONCURRENT_BROWSERS: "${TS_MAX_CONCURRENT_BROWSERS:-}"
+      # Seconds to wait for Chromium to come up (default 45) and for a free
+      # slot when all of the above are busy (default 120).
+      TS_BROWSER_START_TIMEOUT: "${TS_BROWSER_START_TIMEOUT:-}"
+      TS_BROWSER_SLOT_TIMEOUT: "${TS_BROWSER_SLOT_TIMEOUT:-}"
+
+      # --- Automation / notifications --------------------------------------
+      MORNYE_NOTIFY_URL: "${MORNYE_NOTIFY_URL:-}"
+      MORNYE_NOTIFY_TOKEN: "${MORNYE_NOTIFY_TOKEN:-}"
+      MORNYE_LIBRARY_USER: "${MORNYE_LIBRARY_USER:-}"
+      MORNYE_LIBRARY_TOKEN: "${MORNYE_LIBRARY_TOKEN:-}"
+
+      # --- Apple Music metadata / lyrics (optional) ------------------------
+      MORNYE_APPLE_MEDIA_USER_TOKEN: "${MORNYE_APPLE_MEDIA_USER_TOKEN:-}"
+      MORNYE_APPLE_STOREFRONT: "${MORNYE_APPLE_STOREFRONT:-}"
+      MORNYE_APPLE_LYRICS_TRANSLATION: "${MORNYE_APPLE_LYRICS_TRANSLATION:-}"
+      MORNYE_APPLE_LYRICS_PRONUNCIATION: "${MORNYE_APPLE_LYRICS_PRONUNCIATION:-}"
+
+      # Jellyfin cuts word-by-word lyrics into one cue per word and trims each
+      # one, which deletes the space before the next word: "Nuij simm doije"
+      # reaches Jellify and Finamp as "Nuijsimmdoije". Set to 1 to separate the
+      # words with U+2800 BRAILLE PATTERN BLANK instead, which draws the same
+      # but is not whitespace, so the trim leaves it alone. Only affects new
+      # downloads; for tracks already on disk run
+      # `python -m mornye.tools.jellyfin_lyrics_gap <folder> --apply`.
+      MORNYE_LYRICS_JELLYFIN_COMPAT: "${MORNYE_LYRICS_JELLYFIN_COMPAT:-}"
+
+      # --- Logging ----------------------------------------------------------
+      # 0 = plain lines instead of animated bars. Correct for `docker logs`,
+      # which otherwise collapses every bar refresh into "[285B blob data]".
+      MORNYE_PROGRESS_BARS: "${MORNYE_PROGRESS_BARS:-0}"
+
+      # --- Escape hatches: every one of these weakens a security control. ---
+      # All are off unless set to 1/true/yes, so leave them empty.
+      # Names an extension may read from this environment (comma-separated);
+      # the sandbox strips everything else, tokens included.
+      MORNYE_EXT_ENV_PASSTHROUGH: "${MORNYE_EXT_ENV_PASSTHROUGH:-}"
+      # Lets extensions reach RFC1918 / localhost addresses.
+      MORNYE_EXT_ALLOW_PRIVATE_NETWORK: "${MORNYE_EXT_ALLOW_PRIVATE_NETWORK:-}"
+      # Lets extensions write outside their own directories.
+      MORNYE_EXT_ALLOW_ANY_WRITE: "${MORNYE_EXT_ALLOW_ANY_WRITE:-}"
+      MORNYE_EXT_WRITABLE_DIRS: "${MORNYE_EXT_WRITABLE_DIRS:-}"
+      # Disables the extension sandbox entirely. Debugging only.
+      MORNYE_EXT_NO_SANDBOX: "${MORNYE_EXT_NO_SANDBOX:-}"
+      # Installs an extension whose checksum does not match the registry.
+      MORNYE_ALLOW_CHECKSUM_MISMATCH: "${MORNYE_ALLOW_CHECKSUM_MISMATCH:-}"
+      # Lets the web/GUI bridge run a post-download shell command.
+      MORNYE_ALLOW_POST_COMMAND: "${MORNYE_ALLOW_POST_COMMAND:-}"
+      # Stops redacting provider tokens out of httpx logs.
+      MORNYE_NO_LOG_REDACTION: "${MORNYE_NO_LOG_REDACTION:-}"
+
+      TZ: "${TZ:-Europe/Rome}"
+
+    volumes:
+      # Finished audio. /app/downloads is what the image declares as its
+      # downloads VOLUME, what the CLI examples pass explicitly, and — through
+      # MORNYE_DOWNLOAD_DIR above — where --web saves too.
+      #
+      # For a NAS share, replace the named volume with a host path, e.g.
+      #   - /mnt/media/music:/app/downloads
+      # To use another container path, change it here and in
+      # MORNYE_DOWNLOAD_DIR together.
+      - mornye-downloads:/app/downloads
+      # Everything durable *and* the cache: the database, installed
+      # extensions, signed sessions, web users, trusted keys, settings — and
+      # ~/.mornye/.cache, which is where the cache lives now. One volume
+      # is all this needs; older docs mounting /home/mornye/.cache/mornye
+      # separately are pointing at a path nothing writes to any more.
+      - mornye-data:/home/mornye/.mornye
+
+    restart: unless-stopped
+
+    healthcheck:
+      # No curl/wget in the base image, so this uses Python's stdlib.
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+    labels:
+      # The opt-in Watchtower below only touches containers carrying this.
+      com.centurylinklabs.watchtower.enable: "true"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================================
+  # Watchtower — polls GHCR and redeploys mornye when a new image is pushed.
+  # ============================================================================
+  # It mounts the Docker socket, which is root-equivalent on the host. That is
+  # inherent to what it does; it is the reason it is scoped by label below
+  # rather than left to update every container on the machine.
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Only needed for a private registry — see REPO_USER/REPO_PASS below.
+      # - /root/.docker/config.json:/config.json:ro
+    environment:
+      # Update ONLY containers labelled watchtower.enable=true. Without this
+      # a Portainer host gets everything on it updated, Portainer included.
+      WATCHTOWER_LABEL_ENABLE: "true"
+      # Delete the superseded image after a successful update.
+      WATCHTOWER_CLEANUP: "true"
+      # Drop anonymous volumes on recreate; the named ones above survive.
+      WATCHTOWER_REMOVE_VOLUMES: "false"
+      # Check interval in seconds (3600 = hourly). Use WATCHTOWER_SCHEDULE
+      # instead for a cron expression — set one or the other, never both.
+      WATCHTOWER_POLL_INTERVAL: "${WATCHTOWER_POLL_INTERVAL:-3600}"
+      # e.g. "0 0 4 * * *" = every night at 04:00. Leave empty to use the
+      # interval above.
+      WATCHTOWER_SCHEDULE: "${WATCHTOWER_SCHEDULE:-}"
+      # Log what it decided, not just what it changed.
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_LOG_LEVEL: "${WATCHTOWER_LOG_LEVEL:-info}"
+      # Set to "true" for a dry run: it reports updates without applying them.
+      WATCHTOWER_MONITOR_ONLY: "${WATCHTOWER_MONITOR_ONLY:-false}"
+      # Optional push notification on update — shoutrrr URL, e.g.
+      # telegram://TOKEN@telegram?chats=CHAT_ID  or  discord://TOKEN@ID
+      WATCHTOWER_NOTIFICATION_URL: "${WATCHTOWER_NOTIFICATION_URL:-}"
+      WATCHTOWER_NOTIFICATIONS_LEVEL: "info"
+      # Private GHCR only: a PAT with read:packages.
+      REPO_USER: "${GHCR_USER:-}"
+      REPO_PASS: "${GHCR_TOKEN:-}"
+      TZ: "${TZ:-Europe/Rome}"
+    labels:
+      # Lets Watchtower update itself as well as Mornye — without this
+      # label, WATCHTOWER_LABEL_ENABLE above excludes it from its own sweep.
+      com.centurylinklabs.watchtower.enable: "true"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mornye-downloads:
+  mornye-data:

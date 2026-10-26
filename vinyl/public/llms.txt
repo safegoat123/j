@@ -1,0 +1,41 @@
+# Vinyl - Spotify Record Player
+> A beautiful vinyl record player interface for Spotify
+
+## Overview
+Vinyl is a web application that provides an elegant, nostalgic vinyl record player experience for controlling Spotify playback. It features realistic vinyl animations, dynamic theming based on album artwork, and full playback control.
+
+## Features
+- **Vinyl Record Animation**: Realistic spinning vinyl record at 10 RPM with animated tonearm
+- **Spotify Integration**: Full OAuth2 authentication with Spotify Web API and Web Playback SDK
+- **Dynamic Theming**: 5 color themes plus automatic gradient backgrounds extracted from album art
+- **Playback Control**: Play, pause, skip, volume control, and progress seeking (Premium required)
+- **Device Management**: Transfer playback between Spotify Connect devices
+- **Recent Items**: Quick access to recently played tracks, playlists, and albums
+
+## Technical Stack
+- **Framework**: Next.js 15 with React 19
+- **Language**: TypeScript
+- **Styling**: Tailwind CSS 4.1 with shadcn/ui components
+- **Deployment**: Vercel
+
+## Authentication
+This application uses Spotify OAuth2 Authorization Code Flow. Users must authenticate with their Spotify account to use the player. Spotify Premium is required for full playback control features.
+
+## API Endpoints
+- `/api/auth/spotify/login` - Initiates Spotify OAuth flow
+- `/api/auth/spotify/callback` - OAuth callback handler
+- `/api/spotify/player` - Playback state and control
+- `/api/spotify/devices` - Device listing
+- `/api/spotify/recent` - Recently played items
+
+## Privacy
+- User authentication tokens are stored in secure httpOnly cookies
+- No user data is stored on our servers beyond session cookies
+- Album artwork is fetched directly from Spotify's CDN
+
+## Links
+- Website: https://vinyl.pranavkarra.me
+- Developer: Pranav Karra (https://pranavkarra.me)
+
+## Contact
+For questions about this application, please contact the developer through GitHub.
