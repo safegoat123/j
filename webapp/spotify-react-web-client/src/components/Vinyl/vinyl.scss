@@ -1,0 +1,25 @@
+.vinyl-stage {
+  --size: clamp(200px, 30vw, 340px);
+  display: flex; align-items: center; justify-content: center; gap: clamp(16px, 4vw, 48px); flex-wrap: wrap; padding: 24px 0;
+}
+.vinyl-stage__cover {
+  width: var(--size); aspect-ratio: 1; border-radius: 8px; overflow: hidden; box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  .cover { width: 100%; height: 100%; object-fit: cover; }
+}
+.vinyl-stage__deck { position: relative; width: var(--size); aspect-ratio: 1; }
+.vinyl-disc {
+  width: 100%; height: 100%; border-radius: 50%; position: relative;
+  background: radial-gradient(circle at 35% 30%, rgba(255,255,255,.10), transparent 40%), repeating-radial-gradient(circle, #151515 0 1px, #0b0b0b 1px 3px);
+  box-shadow: 0 14px 40px rgba(0,0,0,.6), inset 0 0 0 6px #050505;
+  animation: vinyl-spin 1.8s linear infinite; animation-play-state: paused;
+  &.is-spinning { animation-play-state: running; }
+}
+.vinyl-disc__label { position: absolute; inset: 33%; border-radius: 50%; background: radial-gradient(circle, var(--label) 0 55%, var(--label-2) 56% 62%, var(--label) 63%); box-shadow: inset 0 0 0 2px rgba(0,0,0,.25); transition: background .6s ease; }
+.vinyl-disc__hole { position: absolute; inset: 45%; border-radius: 50%; background: #000; }
+.tonearm { position: absolute; top: -6%; right: -8%; width: 22%; height: 75%; pointer-events: none; }
+.tonearm__base { position: absolute; top: 0; right: 18%; width: 46%; aspect-ratio: 1; border-radius: 50%; background: radial-gradient(circle, #9a9a9a 0 30%, #3a3a3a 32% 100%); box-shadow: 0 4px 12px rgba(0,0,0,.6); }
+.tonearm__arm { position: absolute; top: 9%; right: 38%; width: 7%; height: 88%; border-radius: 4px; background: linear-gradient(90deg, #8c8c8c, #e0e0e0 50%, #8c8c8c); transform-origin: 50% 0; transform: rotate(var(--arm-deg)); transition: transform .6s cubic-bezier(.3,.7,.4,1); }
+.tonearm__head { position: absolute; bottom: -6%; left: -90%; width: 280%; height: 12%; border-radius: 3px; background: #2b2b2b; }
+@keyframes vinyl-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .vinyl-disc { animation: none; } .tonearm__arm { transition: none; } }
+@media (max-width: 767px) { .vinyl-stage { --size: min(70vw, 300px); flex-direction: column; } }
