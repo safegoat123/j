@@ -1,0 +1,366 @@
+"""Tests for core/db.py, the persistent JobQueue, and core/download_log.py."""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from mornye.core import db, download_log
+from mornye.core.history import HistoryManager
+from mornye.core.job_queue import JobQueue, JobStatus
+from mornye.core.models import TrackMetadata
+
+
+def _wait_until(predicate, timeout=3.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition never became true within timeout")
+
+
+# ── Schema ────────────────────────────────────────────────────────────────
+
+
+def test_migrations_are_idempotent():
+    conn = db.connection()
+    before = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+
+    # A second process opening the same file must not re-run anything.
+    db.reset_for_tests()
+    conn = db.connection()
+    after = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+
+    assert before == after
+    rows = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+    assert rows == after
+
+
+def test_dumps_never_raises_on_unserialisable_payload():
+    class Opaque:
+        __slots__ = ()
+
+    # `default=str` handles most things; the marker path covers what it can't.
+    assert isinstance(db.dumps({"x": Opaque()}), str)
+    assert db.loads("{not json", fallback={"a": 1}) == {"a": 1}
+
+
+# ── Job queue persistence ─────────────────────────────────────────────────
+
+
+def test_submitted_job_is_written_to_the_store():
+    q = JobQueue(handler=lambda payload: payload["x"], persist=True)
+    job = q.submit("alice", {"x": 1})
+    _wait_until(lambda: q.get(job.id).status is JobStatus.DONE)
+
+    row = (
+        db.connection().execute("SELECT * FROM jobs WHERE id = ?", (job.id,)).fetchone()
+    )
+    assert row is not None
+    assert row["owner"] == "alice"
+    assert row["status"] == "done"
+    assert row["finished_at"] is not None
+
+
+def test_unfinished_jobs_are_restored_and_rerun() -> None:
+    """A queue built over a store with queued work picks it up."""
+    # Simulate what a killed process leaves behind: one QUEUED, one RUNNING.
+    with db.transaction() as conn:
+        conn.executemany(
+            "INSERT INTO jobs (id, owner, payload, status, created_at, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("j-queued", "alice", db.dumps({"n": 1}), "queued", 1.0, None),
+                ("j-running", "bob", db.dumps({"n": 2}), "running", 2.0, 2.5),
+                ("j-done", "alice", db.dumps({"n": 3}), "done", 3.0, 3.5),
+            ],
+        )
+
+    seen: list[int] = []
+    q = JobQueue(handler=lambda payload: seen.append(payload["n"]), persist=True)
+
+    _wait_until(lambda: len(seen) == 2)
+    # Submission order, and the finished one is never re-run.
+    assert seen == [1, 2]
+    done_job = q.get("j-done")
+    running_job = q.get("j-running")
+    assert done_job is not None and done_job.status is JobStatus.DONE
+    assert running_job is not None and running_job.started_at is not None
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected", "untouched"),
+    [("single-user", "s", "m1"), ("multiuser", "m", "s1")],
+)
+def test_a_queue_restores_only_its_own_kind_of_job(kind, expected, untouched) -> None:
+    """A process restarted in the other mode must not run the other queue's jobs.
+
+    Single-user --web and multi-user persist into the same table with payloads
+    of different shapes, and each handler can only read its own.
+    """
+    with db.transaction() as conn:
+        conn.executemany(
+            "INSERT INTO jobs (id, owner, payload, status, created_at, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("m1", "alice", db.dumps({"n": "m"}), "running", 1.0, "multiuser"),
+                ("s1", "", db.dumps({"n": "s"}), "queued", 2.0, "single-user"),
+            ],
+        )
+
+    seen: list[str] = []
+    q = JobQueue(handler=lambda p: seen.append(p["n"]), persist=True, kind=kind)
+
+    _wait_until(lambda: seen == [expected])
+    assert q.get(untouched) is None
+    row = (
+        db.connection()
+        .execute("SELECT status FROM jobs WHERE id = ?", (untouched,))
+        .fetchone()
+    )
+    assert row["status"] in ("running", "queued"), "left for its own queue"
+
+
+def test_jobs_from_before_queue_kinds_stay_multi_users() -> None:
+    with db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO jobs (id, owner, payload, status, created_at, kind) "
+            "VALUES ('old', 'alice', ?, 'queued', 1.0, '')",
+            (db.dumps({"n": 1}),),
+        )
+        # The backfill an upgrade runs once, on a database that predates kinds.
+        backfill = next(
+            statement
+            for statements in db._MIGRATIONS
+            for statement in statements
+            if statement.startswith("UPDATE jobs SET kind")
+        )
+        conn.execute(backfill)
+
+    seen: list[int] = []
+    JobQueue(handler=lambda p: seen.append(p["n"]), persist=True, kind="multiuser")
+    _wait_until(lambda: seen == [1])
+
+
+def test_persistence_is_off_by_default():
+    q = JobQueue(handler=lambda _payload: None)
+    job = q.submit("alice", {})
+    _wait_until(lambda: q.get(job.id).status is JobStatus.DONE)
+
+    rows = db.connection().execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+    assert rows == 0
+
+
+def test_evicted_jobs_are_dropped_from_the_store():
+    q = JobQueue(handler=lambda _p: None, persist=True, max_history=2)
+    ids = [q.submit("alice", {"i": i}).id for i in range(5)]
+    _wait_until(
+        lambda: all(q.get(i) is None or q.get(i).status is JobStatus.DONE for i in ids)
+    )
+    _wait_until(lambda: len(q.list_all()) <= 2)
+
+    stored = db.connection().execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+    assert stored <= 2
+
+
+def test_quota_check_can_refuse_a_submission():
+    class Refused(RuntimeError):
+        pass
+
+    def check(owner: str) -> None:
+        if owner == "greedy":
+            raise Refused("no more for you")
+
+    q = JobQueue(handler=lambda _p: None, quota_check=check)
+    q.submit("alice", {})  # allowed
+    with pytest.raises(Refused):
+        q.submit("greedy", {})
+
+
+# ── Download log ──────────────────────────────────────────────────────────
+
+
+def test_download_log_records_and_counts(tmp_path):
+    target = tmp_path / "song.flac"
+    target.write_bytes(b"x" * 1024)
+
+    download_log.record(
+        owner="alice",
+        isrc="ITAAA0000001",
+        title="Song",
+        artist="Artist",
+        provider="ext:tidal-web",
+        file_path=str(target),
+        fmt="flac",
+    )
+
+    assert download_log.count_since("alice", 0) == 1
+    assert download_log.bytes_since("alice", 0) == 1024
+    assert download_log.has_isrc("itaaa0000001") is True
+    assert download_log.has_isrc("ITAAA0000001", owner="bob") is False
+    assert download_log.totals("alice") == {"tracks": 1, "bytes": 1024}
+
+
+def test_download_log_hook_reads_result_and_metadata(tmp_path):
+    from mornye.core.models import DownloadResult
+
+    target = tmp_path / "hooked.flac"
+    target.write_bytes(b"y" * 10)
+
+    hook = download_log.record_hook(owner="bob")
+    hook(
+        DownloadResult.ok("ext:qobuz", str(target)),
+        TrackMetadata(
+            id="sp1",
+            title="Hooked",
+            artists="Someone",
+            album="Album",
+            album_artist="Someone",
+            isrc="GBAAA0000002",
+        ),
+    )
+
+    recent = download_log.recent(owner="bob")
+    assert len(recent) == 1
+    assert recent[0].title == "Hooked"
+    assert recent[0].provider == "ext:qobuz"
+    assert recent[0].isrc == "GBAAA0000002"
+
+
+def test_failed_downloads_do_not_count_towards_usage():
+    download_log.record(owner="alice", isrc="X1", success=False)
+    assert download_log.count_since("alice", 0) == 0
+
+
+def _track(isrc: str) -> TrackMetadata:
+    return TrackMetadata(
+        id="sp-" + isrc,
+        title="Song",
+        artists="Artist",
+        album="Album",
+        album_artist="Artist",
+        isrc=isrc,
+    )
+
+
+def test_rerunning_a_playlist_does_not_count_a_file_twice(tmp_path):
+    from mornye.core.models import DownloadResult
+
+    target = tmp_path / "song.m4a"
+    target.write_bytes(b"z" * 100)
+    hook = download_log.record_hook(owner="carol")
+
+    hook(DownloadResult.ok("ext:tidal-web", str(target)), _track("ITAAA0000009"))
+    # Two later runs find the file already on disk and skip it.
+    for _ in range(2):
+        hook(
+            DownloadResult.skipped_result("tidal", str(target)), _track("ITAAA0000009")
+        )
+
+    assert download_log.count_since("carol", 0) == 1
+    assert download_log.totals("carol") == {"tracks": 1, "bytes": 100}
+
+
+def test_first_skip_of_an_unrecorded_file_is_still_learned(tmp_path):
+    from mornye.core.models import DownloadResult
+
+    # A file that was on disk before the log existed: its first skip is the
+    # only chance to learn it, and has_isrc() depends on that.
+    target = tmp_path / "old.m4a"
+    target.write_bytes(b"o" * 50)
+    hook = download_log.record_hook(owner="dave")
+
+    for _ in range(3):
+        hook(
+            DownloadResult.skipped_result("tidal", str(target)), _track("ITAAA0000010")
+        )
+
+    assert download_log.has_isrc("ITAAA0000010", owner="dave") is True
+    assert download_log.count_since("dave", 0) == 1
+
+
+def test_dedup_migration_keeps_one_row_per_file():
+    for _ in range(3):
+        download_log.record(owner="erin", file_path="/music/a.m4a", size_bytes=10)
+    download_log.record(owner="erin", file_path="/music/b.m4a", size_bytes=20)
+    # Another account's copy of the same path is its own file.
+    download_log.record(owner="frank", file_path="/music/a.m4a", size_bytes=10)
+    # Failed attempts have no file and must survive: they are attempts.
+    download_log.record(owner="erin", success=False)
+    download_log.record(owner="erin", success=False)
+
+    conn = db.connection()
+    first = conn.execute(
+        "SELECT MIN(id) FROM downloads WHERE owner = 'erin' AND file_path = '/music/a.m4a'"
+    ).fetchone()[0]
+
+    # Replay the migration the way an instance upgrading from v2 runs it.
+    dedup = next(
+        stmts
+        for stmts in db._MIGRATIONS
+        if any("DELETE FROM downloads" in s for s in stmts)
+    )
+    with conn:
+        for statement in dedup:
+            conn.execute(statement)
+
+    assert download_log.totals("erin") == {"tracks": 2, "bytes": 30}
+    assert download_log.totals("frank") == {"tracks": 1, "bytes": 10}
+    kept = conn.execute(
+        "SELECT id FROM downloads WHERE owner = 'erin' AND file_path = '/music/a.m4a'"
+    ).fetchall()
+    assert [r[0] for r in kept] == [first]
+    failed = conn.execute(
+        "SELECT COUNT(*) FROM downloads WHERE owner = 'erin' AND success = 0"
+    ).fetchone()[0]
+    assert failed == 2
+
+
+# ── History ───────────────────────────────────────────────────────────────
+
+
+def test_history_imports_a_legacy_json_file_once(tmp_path):
+    legacy = tmp_path / "recent-fetches.json"
+    legacy.write_text(
+        '[{"id": "old-1", "title": "Old", "fetched_at": 5}]', encoding="utf-8"
+    )
+
+    manager = HistoryManager(legacy_path=legacy)
+    assert [e["id"] for e in manager.get_all()] == ["old-1"]
+
+    # Cleared entries must not come back on the next read.
+    manager.clear()
+    assert HistoryManager(legacy_path=legacy).get_all() == []
+
+
+def test_history_keeps_most_recent_first_and_dedupes():
+    manager = HistoryManager()
+    for idx in range(3):
+        manager.add(
+            TrackMetadata(
+                id=f"t{idx}",
+                title=f"Track {idx}",
+                artists="A",
+                album="B",
+                album_artist="A",
+            )
+        )
+        time.sleep(0.01)
+
+    ids = [e["id"] for e in manager.get_all()]
+    assert ids[0] == "t2"
+    assert len(ids) == 3
+
+    manager.add(
+        TrackMetadata(
+            id="t0", title="Track 0", artists="A", album="B", album_artist="A"
+        )
+    )
+    ids = [e["id"] for e in manager.get_all()]
+    assert ids[0] == "t0"
+    assert len(ids) == 3
+
+    assert manager.remove("t0") is True
+    assert "t0" not in [e["id"] for e in manager.get_all()]

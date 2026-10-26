@@ -1,0 +1,246 @@
+"""Four things that were wrong, pinned so they stay fixed.
+
+Each of these is a defect that a passing test suite happily allowed, which
+is the only reason they are gathered here rather than scattered: they are
+what the UI got wrong in use, and the tests exist because using it is how
+they were found.
+"""
+
+from __future__ import annotations
+
+
+import pytest
+
+from tui_harness import app_of, drives_the_ui
+
+from mornye.core.paths import default_download_dir
+from mornye.tui.app import MornyeTui
+from mornye.tui.config_state import ConfigState
+from mornye.tui.config_view import quality_choices
+
+
+def _ready_state() -> ConfigState:
+    return ConfigState(url="https://open.spotify.com/track/x", services=["tidal"])
+
+
+async def _settled(pilot) -> None:
+    for _ in range(6):
+        await pilot.pause()
+
+
+# ---------------------------------------------------------------------------
+# 1 · The log pane closes again
+# ---------------------------------------------------------------------------
+
+
+@drives_the_ui
+async def test_closing_the_log_never_leaves_the_focus_nowhere() -> None:
+    """The actual defect: Textual drops focus when its widget is hidden.
+
+    Close the log while reading it and nothing was focused at all — no
+    cursor, arrow keys dead, an interface that looks broken and cannot be
+    steered back.
+    """
+    async with MornyeTui(_ready_state()).run_test(size=(104, 38)) as pilot:
+        await _settled(pilot)
+        pane = app_of(pilot).query_one("#log-pane")
+
+        app_of(pilot)._set_log_visible(True)
+        app_of(pilot).query_one("#log").focus()
+        await pilot.pause()
+        assert type(app_of(pilot).focused).__name__ == "RichLog"
+
+        await pilot.press("ctrl+l")
+        await pilot.pause()
+
+        assert pane.display is False
+        assert app_of(pilot).focused is not None, "the focus went nowhere"
+        assert app_of(pilot).focused.id == "sidebar"
+
+
+@drives_the_ui
+async def test_the_log_toggles_from_wherever_the_focus_is() -> None:
+    """Ctrl+L is priority-bound, so nothing focused can swallow it."""
+    async with MornyeTui(_ready_state()).run_test(size=(104, 38)) as pilot:
+        await _settled(pilot)
+        pane = app_of(pilot).query_one("#log-pane")
+
+        for widget_id in ("#cfg-url", "#cfg-output_dir", "#sidebar"):
+            app_of(pilot).query_one(widget_id).focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+l")
+            await pilot.pause()
+            assert pane.display is True, f"would not open from {widget_id}"
+
+            await pilot.press("ctrl+l")
+            await pilot.pause()
+            assert pane.display is False, f"would not close from {widget_id}"
+
+
+@drives_the_ui
+async def test_escape_closes_the_log() -> None:
+    """A second way out, for terminals that keep Ctrl+L for themselves."""
+    async with MornyeTui(_ready_state()).run_test(size=(104, 38)) as pilot:
+        await _settled(pilot)
+        pane = app_of(pilot).query_one("#log-pane")
+
+        app_of(pilot)._set_log_visible(True)
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert pane.display is False
+
+        # Esc on an already-closed log does nothing rather than reopening it.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert pane.display is False
+
+
+@drives_the_ui
+async def test_a_run_opens_the_log_through_the_same_door(monkeypatch) -> None:
+    """So the focus rule applies to the run's own opening too."""
+
+    class _StubRunner:
+        def __init__(self, cfg, log_level=0) -> None: ...
+
+        async def events(self):
+            yield ("output", "stub line", "info")
+
+    async def _no_memory(self) -> None: ...
+
+    monkeypatch.setattr("mornye.tui.app.DownloadRunner", _StubRunner)
+    monkeypatch.setattr(MornyeTui, "_remember_folder", _no_memory)
+
+    async with MornyeTui(_ready_state()).run_test(size=(104, 38)) as pilot:
+        await _settled(pilot)
+        app_of(pilot).action_start_download()
+        await _settled(pilot)
+
+        assert app_of(pilot).query_one("#log-pane").display is True
+        assert "stub line" in app_of(pilot)._log_lines
+        await pilot.press("ctrl+l")
+        await pilot.pause()
+        assert app_of(pilot).query_one("#log-pane").display is False
+
+
+# ---------------------------------------------------------------------------
+# 2 · Only the three tiers worth choosing
+# ---------------------------------------------------------------------------
+
+
+def test_the_quality_menu_offers_three_tiers_at_most() -> None:
+    with_tidal = [value for _label, value in quality_choices(["tidal"])]
+    assert with_tidal == ["HI_RES_LOSSLESS", "LOSSLESS", "DOLBY_ATMOS"]
+
+    without = [value for _label, value in quality_choices(["deezer", "qobuz"])]
+    assert without == ["HI_RES_LOSSLESS", "LOSSLESS"]
+
+    assert "HI_RES" not in without
+    assert "HIGH" not in without
+    assert "LOW" not in without
+
+
+@drives_the_ui
+async def test_the_menu_follows_the_providers(monkeypatch) -> None:
+    """Atmos appears when Tidal is picked and goes when it is dropped."""
+    from textual.widgets import SelectionList
+
+    # Stubbed rather than skipped-around: the assertion below used to sit
+    # behind `if "tidal" in ...`, so on a machine without the tidal extension
+    # the test ran, passed, and checked nothing. Only this panel's view of
+    # what is installed is replaced — tidal does not become a prerequisite
+    # of the suite.
+    monkeypatch.setattr(
+        "mornye.tui.config_view.installed_service_ids",
+        lambda: ["deezer", "tidal"],
+    )
+
+    state = ConfigState(url="https://x/y", services=["deezer"])
+    async with MornyeTui(state).run_test(size=(104, 40)) as pilot:
+        await _settled(pilot)
+        panel = app_of(pilot).query_one("#download")
+
+        def offered() -> list[str]:
+            # The panel's own record of what it put in the menu, rather than
+            # Select._options: quality labels are not their values, so the
+            # rendered rows cannot answer this, and the private attribute has
+            # already changed shape between Textual releases.
+            return list(panel._quality_values)
+
+        assert "DOLBY_ATMOS" not in offered()
+
+        providers = app_of(pilot).query_one("#cfg-services", SelectionList)
+        values = [str(option.value) for option in providers.options]
+        assert "tidal" in values
+        providers.select(providers.get_option_at_index(values.index("tidal")))
+        await _settled(pilot)
+        assert "DOLBY_ATMOS" in offered()
+
+
+@drives_the_ui
+async def test_dropping_tidal_takes_atmos_with_it() -> None:
+    """The chosen value has to move too, not just the menu."""
+    state = ConfigState(
+        url="https://x/y",
+        services=["tidal"],
+        quality="DOLBY_ATMOS",
+    )
+    async with MornyeTui(state).run_test(size=(104, 40)) as pilot:
+        await _settled(pilot)
+        assert app_of(pilot).state.to_cfg()["quality"] == "DOLBY_ATMOS"
+
+        app_of(pilot).state.services = ["deezer"]
+        app_of(pilot).query_one("#download")._refresh_dependencies()
+        await _settled(pilot)
+
+        assert app_of(pilot).state.to_cfg()["quality"] == "HI_RES_LOSSLESS"
+
+
+# ---------------------------------------------------------------------------
+# 3 & 4 · Where downloads land
+# ---------------------------------------------------------------------------
+
+
+@drives_the_ui
+async def test_the_folder_field_opens_on_music_mornye() -> None:
+    from textual.widgets import Input
+
+    async with MornyeTui().run_test(size=(104, 40)) as pilot:
+        await _settled(pilot)
+
+        assert app_of(pilot).state.output_dir == default_download_dir()
+        assert (
+            app_of(pilot).query_one("#cfg-output_dir", Input).value
+            == default_download_dir()
+        )
+
+
+@drives_the_ui
+async def test_last_run_folder_no_longer_overrides_the_default(monkeypatch) -> None:
+    """A one-off download elsewhere must not become where everything goes."""
+    import mornye.core.session_memory as session_memory
+
+    async def _elsewhere() -> str:
+        return "/tmp/somewhere-i-downloaded-once"
+
+    monkeypatch.setattr(session_memory, "get_last_folder_async", _elsewhere)
+
+    async with MornyeTui().run_test(size=(104, 40)) as pilot:
+        for _ in range(15):
+            await pilot.pause()
+        assert app_of(pilot).state.output_dir == default_download_dir()
+
+
+@pytest.mark.uses_real_download_dir
+def test_the_gui_and_the_tui_default_to_the_same_folder() -> None:
+    """Two frontends with two defaults is two libraries on one machine.
+
+    Asserts the real constants, so it opts out of the suite's temporary
+    download directory — it is testing the default itself, not using it.
+    """
+    pytest.importorskip("webview")
+    from mornye.app import DEFAULT_DOWNLOAD_DIR
+    from mornye.tui.app import DEFAULT_OUTPUT_DIR
+
+    assert DEFAULT_DOWNLOAD_DIR == DEFAULT_OUTPUT_DIR == default_download_dir()
