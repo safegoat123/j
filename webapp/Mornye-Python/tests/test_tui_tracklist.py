@@ -1,0 +1,368 @@
+"""Picking tracks in the TUI, and the run honouring the pick.
+
+The panel itself is a table with a tick column; the part worth guarding is
+the seam behind it. A selection that looks right on screen and does not reach
+`_run_download_async` is the failure nobody would notice until the wrong
+files landed on disk, so the last test here follows the pick all the way into
+the `cfg` the launcher is handed.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+import pytest
+
+import mornye.downloader as downloader
+import mornye.core.tracklist as tracklist_module
+import mornye.launcher as launcher_module
+from tui_harness import app_of, drives_the_ui
+
+from mornye.tui.app import MODES, MornyeTui
+from mornye.tui.config_state import ConfigState
+from mornye.tui.tracklist_view import TracklistPanel
+
+_TRACKS_INDEX = [key for key, _ in MODES].index("tracks")
+_ALBUM = "https://open.spotify.com/album/a1"
+
+
+class _Track:
+    def __init__(self, title, track_id=None):
+        self.title = title
+        self.artists = "Miles Davis"
+        self.album = "Kind of Blue"
+        if track_id is not None:
+            self.id = track_id
+
+
+@pytest.fixture(autouse=True)
+def _no_live_spotify_session(monkeypatch):
+    """Nothing here wants a real Spotify client, and one was being built.
+
+    resolve_tracklist() calls metadata_client_for() *before* the resolver
+    these tests stub, and SpotifyMetadataClient.__init__ runs
+    SpotifyWebClient.initialize() — three live HTTP calls for a session, an
+    access token and a client token. So every test below reached a stubbed
+    resolver by way of the real network, and a hiccup there surfaced as the
+    panel reporting a connection error where the test expected the
+    resolver's own message. That is the intermittent failure this fixture
+    removes; it also takes the network out of a unit test that never meant
+    to be in it.
+    """
+    monkeypatch.setattr(tracklist_module, "metadata_client_for", lambda url: object())
+
+
+@pytest.fixture
+def stub_album(monkeypatch):
+    """Five tracks, the fourth of them without a link of its own."""
+    tracks = [
+        _Track("So What", "1"),
+        _Track("Freddie Freeloader", "2"),
+        _Track("Blue in Green", "3"),
+        _Track("All Blues"),
+        _Track("Flamenco Sketches", "5"),
+    ]
+
+    async def _get(client, url, **kwargs):
+        return ("Kind of Blue", tracks, "cover.jpg", {})
+
+    monkeypatch.setattr(downloader, "_call_metadata_get_url", _get)
+    return tracks
+
+
+@pytest.fixture
+def capture_runs(monkeypatch) -> Any:
+    """Collects the cfg a run would have been given, instead of running it.
+
+    Through monkeypatch, not a bare assignment: `run_download_from_cfg` is a
+    module attribute, and replacing it by hand would leave every later test
+    in the session downloading into a list.
+    """
+    seen: list[dict] = []
+
+    async def _capture(cfg, log_level):
+        seen.append(cfg)
+
+    monkeypatch.setattr(launcher_module, "run_download_from_cfg", _capture)
+    return seen
+
+
+def _ready_state() -> ConfigState:
+    return ConfigState(url=_ALBUM, output_dir="/tmp/mornye-test", services=["tidal"])
+
+
+async def _settled(pilot) -> None:
+    for _ in range(15):
+        await pilot.pause()
+
+
+async def _until(pilot, predicate, what: str, tries: int = 300) -> None:
+    """Pumps the UI until `predicate` holds, then returns.
+
+    A fixed pause count is a bet on how fast the machine is. panel.load()
+    hands the fetch to a worker, so on a loaded box the table could still be
+    empty when the test moved on — and an empty table makes
+    action_toggle_row() a no-op, which surfaced as a command panel missing
+    its "1 of 5 tracks are picked" note rather than as a timeout.
+    """
+    for _ in range(tries):
+        if predicate():
+            return
+        await pilot.pause()
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+async def _loaded(pilot) -> TracklistPanel:
+    app_of(pilot).query_one("#sidebar").index = _TRACKS_INDEX
+    await _settled(pilot)
+    panel = app_of(pilot).query_one("#tracks", TracklistPanel)
+    panel.load()
+    # `_loading` covers every outcome: _load() clears it on the failure
+    # path too, and on the success path it sets self.tracklist before
+    # clearing it — so a settled worker means the rows are there whenever
+    # there were rows to have. Two tests here load a bad link or no URL at
+    # all on purpose, and they settle exactly the same way.
+    await _until(
+        pilot,
+        lambda: not panel._loading,
+        "the tracklist panel's load worker to settle",
+    )
+    await _settled(pilot)
+    return panel
+
+
+# ---------------------------------------------------------------------------
+
+
+@drives_the_ui
+async def test_nothing_is_fetched_until_you_ask(stub_album) -> None:
+    """Opening the panel must not fire a request at a URL you are editing."""
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        app_of(pilot).query_one("#sidebar").index = _TRACKS_INDEX
+        await _settled(pilot)
+
+        panel = app_of(pilot).query_one("#tracks", TracklistPanel)
+        assert len(panel.tracklist) == 0
+        assert "Press Load tracks" in str(
+            app_of(pilot).query_one("#tracks-status").render()
+        )
+
+
+@drives_the_ui
+async def test_loading_lists_the_tracks_all_selected(stub_album) -> None:
+    """The panel exists to take tracks away, so it opens with all of them."""
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        panel = await _loaded(pilot)
+
+        from textual.widgets import DataTable
+
+        table = app_of(pilot).query_one("#tracks-table", DataTable)
+        assert table.row_count == 5
+        assert panel.selected_indices() == [0, 1, 2, 3, 4]
+        assert panel.is_whole_collection
+
+        status = str(app_of(pilot).query_one("#tracks-status").render())
+        assert "5 track(s) in Kind of Blue" in status
+
+
+@drives_the_ui
+async def test_a_track_with_no_link_of_its_own_is_marked(stub_album) -> None:
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        await _loaded(pilot)
+
+        from textual.widgets import DataTable
+
+        table = app_of(pilot).query_one("#tracks-table", DataTable)
+        assert str(table.get_row_at(3)[4]) == "no link"
+        assert str(table.get_row_at(0)[4]) == "Kind of Blue"
+
+
+@drives_the_ui
+async def test_space_toggles_the_row_under_the_cursor(stub_album) -> None:
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        panel = await _loaded(pilot)
+
+        from textual.widgets import DataTable
+
+        table = app_of(pilot).query_one("#tracks-table", DataTable)
+        table.move_cursor(row=1)
+        panel.action_toggle_row()
+        await pilot.pause()
+
+        assert panel.selected_indices() == [0, 2, 3, 4]
+        assert not panel.is_whole_collection
+        assert str(table.get_row_at(1)[0]).strip() in {"·", ""}
+        assert str(table.get_row_at(0)[0]) == "✔"
+
+        panel.action_toggle_row()
+        await pilot.pause()
+        assert panel.selected_indices() == [0, 1, 2, 3, 4]
+
+
+@drives_the_ui
+async def test_all_none_and_invert(stub_album) -> None:
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        panel = await _loaded(pilot)
+
+        panel.action_select_none()
+        await pilot.pause()
+        assert panel.selected_indices() == []
+        assert "nothing would download" in str(
+            app_of(pilot).query_one("#tracks-status").render(),
+        )
+
+        panel.action_invert()
+        await pilot.pause()
+        assert panel.selected_indices() == [0, 1, 2, 3, 4]
+
+        panel.action_select_none()
+        panel.action_select_all()
+        await pilot.pause()
+        assert panel.selected_indices() == [0, 1, 2, 3, 4]
+
+
+@drives_the_ui
+async def test_a_bad_link_is_reported_not_raised(monkeypatch) -> None:
+    async def _boom(client, url, **kwargs):
+        msg = "no such album"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(downloader, "_call_metadata_get_url", _boom)
+
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        panel = await _loaded(pilot)
+
+        assert len(panel.tracklist) == 0
+        assert "no such album" in str(
+            app_of(pilot).query_one("#tracks-status").render()
+        )
+
+
+@drives_the_ui
+async def test_loading_without_a_url_says_where_to_set_one() -> None:
+    state = ConfigState(output_dir="/tmp/o", services=["tidal"])
+    async with MornyeTui(state).run_test(size=(110, 40)) as pilot:
+        await _loaded(pilot)
+        assert "Set a URL on the Download panel" in str(
+            app_of(pilot).query_one("#tracks-status").render(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# The seam: does the pick reach the download?
+# ---------------------------------------------------------------------------
+
+
+@drives_the_ui
+async def test_the_whole_album_is_fetched_as_the_album(
+    stub_album, capture_runs
+) -> None:
+    """All selected keeps the collection URL, ordering and numbering intact."""
+    seen = capture_runs
+
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        await _loaded(pilot)
+        app_of(pilot).action_start_download()
+        for _ in range(60):
+            await pilot.pause()
+            if seen:
+                break
+
+    assert seen and seen[0]["url"] == _ALBUM
+
+
+@drives_the_ui
+async def test_a_pick_reaches_the_downloader_as_track_links(
+    stub_album, capture_runs
+) -> None:
+    """The failure this guards: a pick that looks right and downloads the lot."""
+    seen = capture_runs
+
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        panel = await _loaded(pilot)
+        panel.action_select_none()
+        from textual.widgets import DataTable
+
+        table = app_of(pilot).query_one("#tracks-table", DataTable)
+        for row in (0, 2):
+            table.move_cursor(row=row)
+            panel.action_toggle_row()
+        await pilot.pause()
+
+        app_of(pilot).action_start_download()
+        for _ in range(60):
+            await pilot.pause()
+            if seen:
+                break
+
+    assert seen
+    assert seen[0]["url"] == [
+        "https://open.spotify.com/track/1",
+        "https://open.spotify.com/track/3",
+    ]
+
+
+@drives_the_ui
+async def test_starting_with_nothing_picked_is_refused(
+    stub_album, capture_runs
+) -> None:
+    """An empty pick used to mean 'no opinion', which downloaded everything."""
+    seen = capture_runs
+
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        panel = await _loaded(pilot)
+        panel.action_select_none()
+        await pilot.pause()
+
+        app_of(pilot).action_start_download()
+        await _settled(pilot)
+
+        assert seen == []
+        assert "Nothing selected" in str(app_of(pilot).query_one("#status").content)
+        assert app_of(pilot).query_one("#panels").current == "tracks"
+
+
+@drives_the_ui
+async def test_an_unloaded_panel_leaves_the_url_alone(stub_album, capture_runs) -> None:
+    """No pick is not the same as an empty pick."""
+    seen = capture_runs
+
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        app_of(pilot).action_start_download()
+        for _ in range(60):
+            await pilot.pause()
+            if seen:
+                break
+
+    assert seen and seen[0]["url"] == _ALBUM
+
+
+@drives_the_ui
+async def test_the_command_panel_admits_the_cli_cannot_do_this(stub_album) -> None:
+    async with MornyeTui(_ready_state()).run_test(size=(110, 40)) as pilot:
+        panel = await _loaded(pilot)
+        panel.action_select_none()
+        from textual.widgets import DataTable
+
+        app_of(pilot).query_one("#tracks-table", DataTable).move_cursor(row=0)
+        panel.action_toggle_row()
+
+        # The toggle reaches the command panel as a SelectionChanged
+        # message, so the redraw is a round trip through the message pump
+        # rather than something that has already happened when the call
+        # returns. Waiting on the result instead of on a pause count keeps
+        # this honest on a machine that is busy: the timeout still fails the
+        # test, and says what it was waiting for.
+        await _until(
+            pilot,
+            lambda: (
+                "1 of 5 tracks are picked"
+                in str(app_of(pilot).query_one("#command").content)
+            ),
+            "the command panel to report the narrowed selection",
+        )
+
+        rendered = str(app_of(pilot).query_one("#command").content)
+        assert "1 of 5 tracks are picked" in rendered
+        assert "fetches the whole link" in rendered

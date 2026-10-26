@@ -1,0 +1,187 @@
+"""The search panel, with the catalogue stubbed.
+
+What matters here is what happens to a result once it is picked: it becomes
+the Download panel's URL and nothing else. A search panel that also started
+downloads would be a second copy of the Download panel's rules, and the two
+would drift.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+import pytest
+
+from tui_harness import app_of, drives_the_ui
+
+from mornye.tui.app import MODES, MornyeTui
+from mornye.tui.config_state import ConfigState
+from mornye.tui.search_view import SearchPanel
+
+_SEARCH_INDEX = [key for key, _ in MODES].index("search")
+
+_RESULTS = {
+    "tracks": [
+        {
+            "id": "t1",
+            "name": "So What",
+            "artists": "Miles Davis",
+            "album": "Kind of Blue",
+            "external_url": "https://open.spotify.com/track/t1",
+        },
+        {
+            "id": "t2",
+            "name": "No Link Here",
+            "artists": "Nobody",
+            "external_url": "",
+        },
+    ],
+    "albums": [
+        {
+            "id": "a1",
+            "name": "Kind of Blue",
+            "artists": "Miles Davis",
+            "external_url": "https://open.spotify.com/album/a1",
+        },
+    ],
+    "artists": [],
+    "playlists": [],
+}
+
+
+@pytest.fixture
+def stub_search(monkeypatch) -> Any:
+    queries: list[str] = []
+
+    async def _search(query, limit=50):
+        queries.append(query)
+        return _RESULTS
+
+    import mornye.api_mixins.search as search_module
+
+    monkeypatch.setattr(search_module, "search_metadata_async", _search)
+    return queries
+
+
+def _ready_state() -> ConfigState:
+    return ConfigState(output_dir="/tmp/mornye-test", services=["tidal"])
+
+
+async def _settled(pilot) -> None:
+    for _ in range(12):
+        await pilot.pause()
+
+
+@drives_the_ui
+async def test_slash_goes_to_the_search_box(stub_search) -> None:
+    async with MornyeTui(_ready_state()).run_test() as pilot:
+        app_of(pilot).query_one("#sidebar").focus()
+        await pilot.pause()
+
+        await pilot.press("slash")
+        await _settled(pilot)
+
+        assert app_of(pilot).query_one("#panels").current == "search"
+        assert app_of(pilot).focused is app_of(pilot).query_one("#search-query")
+
+
+@drives_the_ui
+async def test_results_are_listed_and_linkless_ones_dropped(stub_search) -> None:
+    async with MornyeTui(_ready_state()).run_test() as pilot:
+        app_of(pilot).query_one("#sidebar").index = _SEARCH_INDEX
+        await _settled(pilot)
+
+        panel = app_of(pilot).query_one("#search", SearchPanel)
+        panel.search("miles")
+        await _settled(pilot)
+
+        from textual.widgets import DataTable
+
+        table = app_of(pilot).query_one("#search-results", DataTable)
+        # Two of the three have a link; the third would be a decorative row.
+        assert table.row_count == 2
+        assert stub_search == ["miles"]
+        assert "2 result(s)" in str(app_of(pilot).query_one("#search-status").render())
+
+
+@drives_the_ui
+async def test_picking_a_result_fills_the_download_url(stub_search) -> None:
+    async with MornyeTui(_ready_state()).run_test() as pilot:
+        app_of(pilot).query_one("#sidebar").index = _SEARCH_INDEX
+        await _settled(pilot)
+
+        panel = app_of(pilot).query_one("#search", SearchPanel)
+        panel.search("miles")
+        await _settled(pilot)
+
+        panel.post_message(
+            SearchPanel.UrlChosen("https://open.spotify.com/album/a1", "Kind of Blue"),
+        )
+        await _settled(pilot)
+
+        from textual.widgets import Input
+
+        assert (
+            app_of(pilot).query_one("#cfg-url", Input).value
+            == "https://open.spotify.com/album/a1"
+        )
+        assert app_of(pilot).state.url == "https://open.spotify.com/album/a1"
+        assert app_of(pilot).query_one("#panels").current == "download"
+        assert "Kind of Blue" in str(app_of(pilot).query_one("#status").content)
+
+
+@drives_the_ui
+async def test_an_empty_query_is_not_searched(stub_search) -> None:
+    async with MornyeTui(_ready_state()).run_test() as pilot:
+        app_of(pilot).query_one("#sidebar").index = _SEARCH_INDEX
+        await _settled(pilot)
+
+        app_of(pilot).query_one("#search", SearchPanel).search("   ")
+        await _settled(pilot)
+
+        assert stub_search == []
+        assert "Type something" in str(
+            app_of(pilot).query_one("#search-status").render()
+        )
+
+
+@drives_the_ui
+async def test_a_failing_search_is_reported_not_raised(monkeypatch) -> None:
+    async def _explode(query, limit=50):
+        msg = "spotify said no"
+        raise RuntimeError(msg)
+
+    import mornye.api_mixins.search as search_module
+
+    monkeypatch.setattr(search_module, "search_metadata_async", _explode)
+
+    async with MornyeTui(_ready_state()).run_test() as pilot:
+        app_of(pilot).query_one("#sidebar").index = _SEARCH_INDEX
+        await _settled(pilot)
+
+        app_of(pilot).query_one("#search", SearchPanel).search("miles")
+        await _settled(pilot)
+
+        assert "spotify said no" in str(
+            app_of(pilot).query_one("#search-status").render(),
+        )
+
+
+@drives_the_ui
+async def test_nothing_found_says_so(monkeypatch) -> None:
+    async def _nothing(query, limit=50):
+        return {"tracks": [], "albums": [], "artists": [], "playlists": []}
+
+    import mornye.api_mixins.search as search_module
+
+    monkeypatch.setattr(search_module, "search_metadata_async", _nothing)
+
+    async with MornyeTui(_ready_state()).run_test() as pilot:
+        app_of(pilot).query_one("#sidebar").index = _SEARCH_INDEX
+        await _settled(pilot)
+
+        app_of(pilot).query_one("#search", SearchPanel).search("zzzz")
+        await _settled(pilot)
+
+        assert "Nothing for" in str(app_of(pilot).query_one("#search-status").render())

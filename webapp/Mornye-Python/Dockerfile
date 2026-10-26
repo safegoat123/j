@@ -1,0 +1,107 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Set Python environment variables and default virtual screen for Xvfb
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DISPLAY=:99
+
+# Install system dependencies:
+# - ffmpeg and flac: for audio processing
+# - nodejs: for Mornye extensions
+# - xvfb: to create the virtual display (MANDATORY for Chromium even without VNC)
+# - chromium and fonts-liberation: browser for Pydoll and web fonts
+# - tini: PID 1 that reaps orphaned processes (see ENTRYPOINT below)
+# - procps: pkill, which core/solver.py uses to force-kill a browser that
+#   will not stop — without it that kill silently does nothing
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        tini \
+        procps \
+        ca-certificates \
+        ffmpeg \
+        flac \
+        nodejs \
+        xvfb \
+        fluxbox \
+        x11vnc \
+        novnc \
+        websockify \
+        chromium \
+        fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml requirements.txt ./
+
+RUN python3 -m pip install --upgrade pip setuptools wheel \
+    && python3 -m pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+RUN python3 -m pip install --no-cache-dir .
+
+# Runs as a normal user, not root. This image installs and then executes
+# third-party extensions (Node and Python) fetched from whatever registry the
+# operator configured, and — in --web mode — does so behind a server that is
+# unauthenticated unless a token is set. Root inside the container is a much
+# larger blast radius than that combination deserves, and it is also what
+# makes bind-mounted downloads come out owned by root on the host.
+#
+# UID 1000 matches the first non-system user on most Linux hosts, so mounted
+# volumes line up without a chown. If yours differs there is no need to
+# rebuild: run the container with `user: "UID:GID"`, or with `user: "0:0"` and
+# PUID/PGID to have the volumes chowned for you before privileges are dropped
+# (see docker-entrypoint.sh and docs/guide/docker.md). The build args remain
+# for anyone who wants the image's own default changed:
+#   docker build --build-arg APP_UID=1234 --build-arg APP_GID=1234 .
+ARG APP_UID=1000
+ARG APP_GID=1000
+ENV HOME=/home/mornye
+
+RUN groupadd --gid "${APP_GID}" mornye \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" \
+        --create-home --home-dir "${HOME}" mornye \
+    && mkdir -p /app/downloads \
+                "${HOME}/.mornye/extensions" \
+                "${HOME}/.mornye/signed_sessions" \
+    && chown -R mornye:mornye /app "${HOME}"
+
+# Cache data is stored under ~/.mornye/.cache (see core/paths.py), inside the
+# durable state volume, so it does not need a separate Docker volume.
+VOLUME ["/app/downloads", "/home/mornye/.mornye"]
+
+# ==============================================================================
+# [VNC/WEB SCREEN] — desktop GUI over VNC (default `mornye --gui` path):
+# - 6080: Web Browser access (noVNC) -> http://localhost:6080/vnc.html
+# - 5900: Classic VNC client access (e.g., RealVNC, TigerVNC)
+#
+# [WEB MODE] — `mornye --web` (see docker-entrypoint.sh): no VNC needed,
+# uses a lightweight local web server instead.
+# - 8000: web GUI -> http://localhost:8000
+# ==============================================================================
+EXPOSE 6080 5900 8000
+
+# No blanket HEALTHCHECK here on purpose: this same image runs three very
+# different things depending on the CMD it's given — a one-shot CLI download
+# that's *supposed* to exit, a VNC-backed --gui session, and a long-running
+# --web server — and a check written for one of those would be meaningless
+# (or actively misleading) for the other two. docker-compose.example.yml
+# commits to --web specifically and defines a real HTTP healthcheck there.
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Last, and after the chmod above: /usr/local/bin is root-owned, so dropping
+# privileges any earlier makes that RUN fail and the image fail to build.
+USER mornye
+
+# tini as PID 1. The entrypoint execs python, which would otherwise be PID 1 —
+# and PID 1 is who inherits every orphan. core/solver.py ends a Turnstile
+# browser with `pkill -KILL` when stop() fails; Chromium's crashpad/zygote
+# children then outlive their parent, get reparented to python, and python
+# never wait()s for processes it did not start, so each solve left a handful of
+# <defunct> chromium processes behind for the life of the container. tini
+# reaps them, and forwards SIGTERM so `docker stop` still shuts down cleanly.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+CMD ["--help"]

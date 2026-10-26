@@ -1,0 +1,662 @@
+"""Tests for the versioned REST API mounted at /api/v1 (mornye/webapi)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+import sqlite3
+import subprocess
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from mornye.core.models import TrackMetadata
+from mornye.webapi import ApiDeps, build_v1_router
+
+
+class FakeApi:
+    """The slice of MornyeAPI the v1 router actually touches."""
+
+    def __init__(self, download_dir: str = "/downloads") -> None:
+        self.app_version = "9.9.9"
+        self.download_dir = download_dir
+        self.fetched: list[str] = []
+
+    def fetch_metadata(self, url: str) -> None:
+        self.fetched.append(url)
+
+    def get_extension_health(self) -> dict:
+        return {
+            "providers": [
+                {
+                    "provider": "ext:tidal-web",
+                    "attempts": 3,
+                    "successes": 2,
+                    "failures": 1,
+                    "success_rate": 2 / 3,
+                    "avg_duration_s": 1.5,
+                    "last_outcome": "success",
+                    "last_error": "",
+                    "version": "1.0.0",
+                    "installed": True,
+                }
+            ],
+            "totals": {
+                "extensions": 1,
+                "attempts": 3,
+                "successes": 2,
+                "failures": 1,
+                "success_rate": 2 / 3,
+            },
+        }
+
+
+def make_client(**deps_kwargs) -> tuple[TestClient, FakeApi]:
+    api = FakeApi(**{k: v for k, v in deps_kwargs.items() if k == "download_dir"})
+    deps_kwargs.pop("download_dir", None)
+    app = FastAPI()
+    app.include_router(
+        build_v1_router(ApiDeps(api_for=lambda _request: api, **deps_kwargs))
+    )
+    return TestClient(app), api
+
+
+# ── Instance ──────────────────────────────────────────────────────────────
+
+
+def test_info_reports_the_instance_shape():
+    client, _ = make_client()
+    body = client.get("/api/v1/info").json()
+
+    assert body["version"] == "9.9.9"
+    assert body["api_version"] == "v1"
+    assert body["multiuser"] is False
+    assert body["authenticated"] is False
+
+
+def test_info_reports_authentication_when_a_token_is_set():
+    client, _ = make_client(token_required=True)
+    assert client.get("/api/v1/info").json()["authenticated"] is True
+
+
+def test_the_openapi_document_describes_every_route():
+    client, _ = make_client()
+    schema = client.get("/openapi.json").json()
+
+    for path in (
+        "/api/v1/info",
+        "/api/v1/resolve",
+        "/api/v1/downloads",
+        "/api/v1/subscriptions",
+        "/api/v1/extensions",
+    ):
+        assert path in schema["paths"], path
+    # Declared response models, not free-form dicts — the whole point.
+    assert "ResolveResponse" in schema["components"]["schemas"]
+    assert "ErrorResponse" in schema["components"]["schemas"]
+
+
+# ── Validation ────────────────────────────────────────────────────────────
+
+
+def test_a_blank_url_is_rejected_before_anything_is_attempted():
+    client, api = make_client()
+    assert client.post("/api/v1/resolve", json={"url": "   "}).status_code == 422
+    assert client.post("/api/v1/downloads", json={"url": ""}).status_code == 422
+    assert api.fetched == []
+
+
+def test_search_rejects_an_out_of_range_limit():
+    client, _ = make_client()
+    assert (
+        client.get("/api/v1/search", params={"q": "x", "limit": 999}).status_code == 422
+    )
+    assert client.get("/api/v1/search", params={"q": ""}).status_code == 422
+
+
+def test_resolve_reports_a_bad_url_as_a_client_error(monkeypatch):
+    class Boom:
+        async def get_url_async(self, *_a, **_k):
+            raise ValueError("nope")
+
+    monkeypatch.setattr(
+        "mornye.core.spotify_metadata.SpotifyMetadataClient", lambda *a, **k: Boom()
+    )
+    client, _ = make_client()
+    response = client.post("/api/v1/resolve", json={"url": "https://x.invalid/y"})
+
+    assert response.status_code == 400
+    # The internal message never reaches the caller.
+    assert "nope" not in response.text
+
+
+def test_resolve_returns_declared_tracks(monkeypatch):
+    track = TrackMetadata(
+        id="t1",
+        title="Song",
+        artists="Artist",
+        album="Album",
+        album_artist="Artist",
+        isrc="ITAAA0000001",
+        duration_ms=1000,
+    )
+
+    class Fake:
+        async def get_url_async(self, url, include_featuring=True):
+            return ("An Album", [track], "cover", {})
+
+    monkeypatch.setattr(
+        "mornye.core.spotify_metadata.SpotifyMetadataClient", lambda *a, **k: Fake()
+    )
+    client, _ = make_client()
+    body = client.post(
+        "/api/v1/resolve",
+        json={"url": "https://open.spotify.com/album/0000000000000000000000"},
+    ).json()
+
+    assert body["name"] == "An Album"
+    assert body["kind"] == "album"
+    assert body["total"] == 1
+    assert body["tracks"][0]["isrc"] == "ITAAA0000001"
+
+
+def test_resolve_classifies_the_url_off_the_event_loop(monkeypatch):
+    """parse_spotify_url() expands a share short link over the network.
+
+    Called straight from the coroutine that is already on the event loop, one
+    of those blocks every other request for the length of the round trip.
+    """
+    from mornye.core import spotify_metadata
+
+    class Fake:
+        async def get_url_async(self, url, include_featuring=True):
+            return ("An Album", [], "cover", {})
+
+    saw_running_loop = []
+
+    def parse(url):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            saw_running_loop.append(False)
+        else:
+            saw_running_loop.append(True)
+        return {"type": "album", "id": "0" * 22}
+
+    monkeypatch.setattr(
+        "mornye.core.spotify_metadata.SpotifyMetadataClient", lambda *a, **k: Fake()
+    )
+    monkeypatch.setattr(spotify_metadata, "parse_spotify_url", parse)
+    client, _ = make_client()
+
+    body = client.post(
+        "/api/v1/resolve",
+        json={"url": "https://spotify.link/abc123"},
+    ).json()
+
+    assert body["kind"] == "album"
+    assert saw_running_loop == [False], "parse_spotify_url ran on the event loop"
+
+
+# ── Downloads ─────────────────────────────────────────────────────────────
+
+
+class FakeQueue:
+    def __init__(self) -> None:
+        self.jobs: dict[str, object] = {}
+        self.submitted: list[tuple[str, dict]] = []
+
+    def submit(self, owner, payload):
+        from mornye.core.job_queue import Job
+
+        job = Job(id=f"j{len(self.jobs)}", owner=owner, payload=payload)
+        self.jobs[job.id] = job
+        self.submitted.append((owner, payload))
+        return job
+
+    def get(self, job_id):
+        return self.jobs.get(job_id)
+
+    def list_all(self):
+        return list(self.jobs.values())
+
+    def list_for(self, owner):
+        return [j for j in self.jobs.values() if j.owner == owner]
+
+
+def test_a_queued_download_answers_202_with_a_job():
+    queue = FakeQueue()
+    client, _ = make_client(job_queue=queue)
+
+    response = client.post(
+        "/api/v1/downloads", json={"url": "https://open.spotify.com/track/x"}
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert queue.submitted[0][1]["url"].endswith("/track/x")
+
+
+def test_without_a_queue_the_download_is_dispatched_directly():
+    client, api = make_client()
+    response = client.post(
+        "/api/v1/downloads", json={"url": "https://open.spotify.com/track/x"}
+    )
+
+    assert response.status_code == 202
+    assert response.json()["id"] == "direct"
+    assert api.fetched == ["https://open.spotify.com/track/x"]
+
+
+def test_a_full_queue_answers_429_without_leaking_the_message():
+    class FullQueue(FakeQueue):
+        def submit(self, owner, payload):
+            from mornye.core.job_queue import QueueFullError
+
+            raise QueueFullError("internal detail", pending=50, limit=50)
+
+    client, _ = make_client(job_queue=FullQueue())
+    response = client.post("/api/v1/downloads", json={"url": "https://x/y"})
+
+    assert response.status_code == 429
+    assert "internal detail" not in response.text
+    assert "50 queued" in response.text
+
+
+def test_output_dir_is_ignored_in_multiuser_mode():
+    queue = FakeQueue()
+    client, _ = make_client(
+        job_queue=queue, multiuser=True, username_for=lambda _r: "alice"
+    )
+
+    client.post(
+        "/api/v1/downloads",
+        json={"url": "https://x/y", "output_dir": "/etc"},
+    )
+
+    assert "output_dir" not in queue.submitted[0][1]["config"]
+    assert queue.submitted[0][0] == "alice"
+
+
+def test_output_dir_is_honoured_in_single_user_mode():
+    queue = FakeQueue()
+    client, _ = make_client(job_queue=queue)
+    client.post(
+        "/api/v1/downloads", json={"url": "https://x/y", "output_dir": "/music"}
+    )
+
+    assert queue.submitted[0][1]["config"]["output_dir"] == "/music"
+
+
+def test_one_account_cannot_read_another_accounts_job():
+    queue = FakeQueue()
+    client, _ = make_client(
+        job_queue=queue, multiuser=True, username_for=lambda _r: "alice"
+    )
+    client.post("/api/v1/downloads", json={"url": "https://x/y"})
+
+    # Same app, but now every request is bob.
+    client2, _ = make_client(
+        job_queue=queue, multiuser=True, username_for=lambda _r: "bob"
+    )
+    assert client2.get("/api/v1/downloads/j0").status_code == 404
+    assert client2.get("/api/v1/downloads").json()["jobs"] == []
+    # And alice still sees her own.
+    assert client.get("/api/v1/downloads/j0").status_code == 200
+
+
+def test_an_unknown_job_is_404():
+    client, _ = make_client(job_queue=FakeQueue())
+    assert client.get("/api/v1/downloads/nope").status_code == 404
+
+
+# ── History ───────────────────────────────────────────────────────────────
+
+
+def test_history_reports_the_download_log_without_paths():
+    from mornye.core import download_log
+
+    download_log.record(
+        owner="",
+        title="Song",
+        artist="Artist",
+        provider="ext:tidal-web",
+        file_path="/home/secret/Music/song.flac",
+        fmt="flac",
+        size_bytes=10,
+    )
+    client, _ = make_client()
+    body = client.get("/api/v1/history").json()
+
+    assert body["total"] == 1
+    assert body["downloads"][0]["title"] == "Song"
+    assert "file_path" not in body["downloads"][0]
+    assert "/home/secret" not in json.dumps(body)
+
+
+# ── Subscriptions ─────────────────────────────────────────────────────────
+
+
+def test_subscriptions_round_trip():
+    client, _ = make_client()
+    artist = "https://open.spotify.com/artist/0000000000000000000000"
+
+    created = client.post("/api/v1/subscriptions", json={"url": artist, "name": "A"})
+    assert created.status_code == 201
+    sub_id = created.json()["id"]
+    assert created.json()["include_groups"] == "album,single"
+
+    listing = client.get("/api/v1/subscriptions").json()
+    assert [s["id"] for s in listing["subscriptions"]] == [sub_id]
+
+    assert client.delete(f"/api/v1/subscriptions/{sub_id}").status_code == 204
+    assert client.get("/api/v1/subscriptions").json()["subscriptions"] == []
+
+
+def test_an_invalid_release_group_is_a_400():
+    client, _ = make_client()
+    response = client.post(
+        "/api/v1/subscriptions",
+        json={
+            "url": "https://open.spotify.com/artist/0000000000000000000000",
+            "include_groups": "bootlegs",
+        },
+    )
+    assert response.status_code == 400
+    assert "bootlegs" in response.text
+
+
+def test_deleting_an_unknown_subscription_is_404():
+    client, _ = make_client()
+    assert client.delete("/api/v1/subscriptions/nope").status_code == 404
+
+
+# ── Extensions ────────────────────────────────────────────────────────────
+
+
+def test_extension_health_is_served_from_the_api_object():
+    client, _ = make_client()
+    body = client.get("/api/v1/extensions").json()
+
+    assert body["providers"][0]["provider"] == "ext:tidal-web"
+    assert body["totals"]["attempts"] == 3
+
+
+# ── Library ───────────────────────────────────────────────────────────────
+
+
+def test_library_scan_is_confined_to_the_download_folder(tmp_path):
+    client, _ = make_client(download_dir=str(tmp_path))
+
+    outside = client.post(
+        "/api/v1/library/scan", json={"path": "/", "target_quality": "LOSSLESS"}
+    )
+    assert outside.status_code == 400
+    assert "outside" in outside.text
+
+    traversal = client.post(
+        "/api/v1/library/scan", json={"path": str(tmp_path / ".." / "..")}
+    )
+    assert traversal.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "escape",
+    [
+        "../../../etc",  # relative traversal, no leading slash
+        "sub/../../..",  # traversal that only escapes once resolved
+        "/etc/passwd",  # absolute, elsewhere entirely
+        "~",  # the home directory, spelled the short way
+        "~/.ssh",
+    ],
+)
+def test_library_scan_refuses_every_shape_of_escape(tmp_path, escape):
+    """A relative path is resolved against the download folder, not the
+    server's working directory, and either way only the containment check
+    decides. None of these may reach a scan."""
+    client, _ = make_client(download_dir=str(tmp_path))
+
+    response = client.post("/api/v1/library/scan", json={"path": escape})
+
+    assert response.status_code == 400
+    assert "outside" in response.text
+
+
+def test_library_scan_accepts_a_path_relative_to_the_download_folder(tmp_path):
+    (tmp_path / "albums").mkdir()
+    client, _ = make_client(download_dir=str(tmp_path))
+
+    body = client.post("/api/v1/library/scan", json={"path": "albums"}).json()
+
+    assert body["scanned"] == 0
+
+
+def test_library_scan_expands_a_download_folder_written_with_a_tilde(
+    monkeypatch, tmp_path
+):
+    """`~/Music` as the configured folder must name the home directory, not a
+    folder called "~" beside the server's working directory — which would
+    reject every path a caller could name."""
+    # expanduser() reads the environment, not Path.home(), and which variable
+    # it reads is per-platform: $HOME on POSIX, %USERPROFILE% on Windows.
+    # Both are set, and the redirect is verified rather than assumed — a
+    # platform that honours neither would otherwise fail this as if the code
+    # under test were wrong.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    if Path("~").expanduser() != tmp_path:
+        pytest.skip("home directory cannot be redirected on this platform")
+
+    library = tmp_path / "Music"
+    library.mkdir()
+    client, _ = make_client(download_dir="~/Music")
+
+    body = client.post("/api/v1/library/scan", json={"path": str(library)}).json()
+
+    assert body["scanned"] == 0
+
+
+def test_library_scan_reports_an_empty_folder(tmp_path):
+    client, _ = make_client(download_dir=str(tmp_path))
+    body = client.post("/api/v1/library/scan", json={"path": str(tmp_path)}).json()
+
+    assert body["scanned"] == 0
+    assert body["candidates"] == []
+    assert body["target"] == "LOSSLESS"
+
+
+def test_library_duplicates_is_confined_to_the_download_folder(tmp_path):
+    client, _ = make_client(download_dir=str(tmp_path))
+
+    outside = client.post("/api/v1/library/duplicates", json={"path": "/"})
+    assert outside.status_code == 400
+    assert "outside" in outside.text
+
+    traversal = client.post(
+        "/api/v1/library/duplicates", json={"path": str(tmp_path / ".." / "..")}
+    )
+    assert traversal.status_code == 400
+
+
+def test_library_duplicates_reports_an_empty_folder(tmp_path):
+    client, _ = make_client(download_dir=str(tmp_path))
+    body = client.post(
+        "/api/v1/library/duplicates", json={"path": str(tmp_path)}
+    ).json()
+
+    assert body["groups"] == 0
+    assert body["duplicate_groups"] == []
+    assert body["library"]["files"] == 0
+    assert body["match"] == "both"
+    assert body["database"] == ""
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("disk full"), sqlite3.OperationalError("database is locked")],
+)
+def test_library_duplicates_survives_an_index_it_cannot_write(
+    tmp_path, monkeypatch, failure
+):
+    """The index is a convenience on top of the scan.
+
+    Whatever the export raises, the scan itself succeeded and its answer is
+    owed to the caller. sqlite3's errors are not OSErrors, so a locked or
+    unwritable database used to come back as a 500 with no report in it.
+    """
+    from mornye.core import library_dedup
+
+    def explode(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(library_dedup, "export_sqlite", explode)
+    client, _ = make_client(download_dir=str(tmp_path))
+
+    response = client.post(
+        "/api/v1/library/duplicates", json={"path": str(tmp_path), "export_db": True}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["database"] == ""
+
+
+def test_library_duplicates_rejects_a_match_mode_it_does_not_have(tmp_path):
+    client, _ = make_client(download_dir=str(tmp_path))
+    resp = client.post(
+        "/api/v1/library/duplicates", json={"path": str(tmp_path), "match": "vibes"}
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None, reason="needs ffmpeg to build audio fixtures"
+)
+def test_library_duplicates_groups_and_can_write_its_index(tmp_path, monkeypatch):
+    monkeypatch.setenv("MORNYE_CACHE_DIR", str(tmp_path / "cache"))
+    library = tmp_path / "music"
+    library.mkdir()
+    for name, codec in (("a.flac", "flac"), ("b.mp3", "libmp3lame")):
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2:sample_rate=44100",
+                "-c:a",
+                codec,
+                "-metadata",
+                "title=Song",
+                "-metadata",
+                "artist=A",
+                str(library / name),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    client, _ = make_client(download_dir=str(tmp_path))
+    body = client.post(
+        "/api/v1/library/duplicates", json={"path": str(library), "export_db": True}
+    ).json()
+
+    assert body["library"]["files"] == 2
+    assert body["groups"] == 1
+    group = body["duplicate_groups"][0]
+    assert group["keep"]["path"].endswith(".flac")
+    assert [f["path"].endswith(".mp3") for f in group["duplicates"]] == [True]
+    assert body["reclaimable_bytes"] > 0
+    assert Path(body["database"]).exists()
+
+    # Read-only: the endpoint reports the duplicate, it does not remove it.
+    assert (library / "b.mp3").exists()
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────
+
+
+def test_stats_reports_the_log_as_a_dashboard():
+    from mornye.core import download_log
+
+    download_log.record(
+        title="Song",
+        artist="Daft Punk, Julian Casablancas",
+        album="Random Access Memories",
+        provider="ext:tidal-web",
+        fmt="flac",
+        size_bytes=40,
+        genre="Electronic; House",
+        release_year="2013",
+        duration_ms=337_000,
+    )
+    client, _ = make_client()
+    body = client.get("/api/v1/stats").json()
+
+    assert body["totals"]["tracks"] == 1
+    assert body["totals"]["artists"] == 2
+    assert body["window"]["label"] == "all time"
+    assert {entry["name"] for entry in body["top_genres"]["entries"]} == {
+        "Electronic",
+        "House",
+    }
+    assert body["decades"]["entries"][0]["name"] == "2010s"
+
+
+def test_stats_windows_are_named_in_the_response():
+    client, _ = make_client()
+
+    assert client.get("/api/v1/stats?year=2026").json()["window"]["label"] == "2026"
+    assert (
+        client.get("/api/v1/stats?days=30").json()["window"]["label"] == "last 30 days"
+    )
+    # Out of range rather than silently clamped.
+    assert client.get("/api/v1/stats?days=0").status_code == 422
+
+
+def test_stats_are_empty_but_valid_before_anything_is_downloaded():
+    client, _ = make_client()
+    body = client.get("/api/v1/stats").json()
+
+    assert body["totals"]["tracks"] == 0
+    assert body["top_artists"] == []
+    assert body["first"] is None
+
+
+# ── CSV input ─────────────────────────────────────────────────────────────
+
+
+def test_csv_resolve_turns_rows_into_links_without_queueing_them():
+    client, api = make_client()
+    content = (
+        "Track URI,Track Name,Artist Name(s)\n"
+        "spotify:track:4uLU6hMCjMI75M1A2tKUQC,Never Gonna Give You Up,Rick Astley\n"
+        "https://open.spotify.com/track/1301WleyT98MSxVHPZCA6M,Everlong,Foo Fighters\n"
+    )
+
+    body = client.post(
+        "/api/v1/csv/resolve", json={"content": content, "name": "export.csv"}
+    ).json()
+
+    assert body["rows"] == 2
+    assert body["urls"] == [
+        "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC",
+        "https://open.spotify.com/track/1301WleyT98MSxVHPZCA6M",
+    ]
+    assert [row["how"] for row in body["resolved"]] == ["link", "link"]
+    # Resolving is not downloading: nothing was fetched or queued.
+    assert api.fetched == []
+
+
+def test_a_csv_with_nothing_recognisable_in_it_is_a_400():
+    client, _ = make_client()
+    response = client.post("/api/v1/csv/resolve", json={"content": "\n\n"})
+
+    assert response.status_code == 400
+    assert "error" in response.json()
