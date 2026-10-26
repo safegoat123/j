@@ -1,150 +1,48 @@
-import { memo, useEffect, useState, type FC, type ReactElement } from 'react';
-
-// Components
-import { Col, Row } from 'antd';
-import { Navbar } from './components/Navbar';
-import { Library } from './components/Library';
-import PlayingBar from './components/PlayingBar';
-import { PlayingNow } from './components/NowPlaying';
-import { LanguageModal } from '../Modals/LanguageModal';
-import { LibraryDrawer } from '../Drawers/LibraryDrawer';
-import { PlayingNowDrawer } from '../Drawers/PlayingNowDrawer';
-import { EditPlaylistModal } from '../Modals/EditPlaylistModal';
-import { Group, Panel, Separator, useDefaultLayout } from 'react-resizable-panels';
-
-// Redux
+import { memo, useEffect, useRef, type ReactNode } from 'react';
+import { NavLink, useLocation } from 'react-router-dom';
+import { FaCog, FaCompactDisc, FaHeart, FaHome, FaPlus, FaSearch } from 'react-icons/fa';
+import { MdLibraryMusic } from 'react-icons/md';
 import { useAppDispatch, useAppSelector } from '../../store/store';
-import { isActiveOnOtherDevice, spotifyActions } from '../../store/slices/spotify';
-import { getLibraryCollapsed, isRightLayoutOpen, uiActions } from '../../store/slices/ui';
-import { LoginFooter } from './components/LoginFooter';
-import { LoginModal } from '../Modals/LoginModal';
-import useIsMobile from '../../utils/isMobile';
+import { uiActions } from '../../store/slices/ui';
+import { usePlaylistsQuery } from '../../store/api';
+import PlayingBar from '../PlayingBar';
+import QueuePanel from '../QueuePanel';
+import { PlaylistModals } from '../Modals/PlaylistModals';
 
-const pct = (value: number) => `${value}%`;
-
-export const AppLayout: FC<{ children: ReactElement }> = memo((props) => {
+const NAV: { to: string; label: string; icon: ReactNode; end?: boolean }[] = [
+  { to: '/', label: '홈', icon: <FaHome />, end: true },
+  { to: '/search', label: '검색', icon: <FaSearch /> },
+  { to: '/library', label: '보관함', icon: <MdLibraryMusic /> },
+  { to: '/collection/tracks', label: '좋아요 표시한 곡', icon: <FaHeart /> },
+  { to: '/settings', label: '라이브러리 관리', icon: <FaCog /> },
+];
+const Sidebar = memo(() => {
   const dispatch = useAppDispatch();
-  const user = useAppSelector((state) => !!state.auth.user);
-  const rightLayoutOpen = useAppSelector(isRightLayoutOpen);
-  const libraryCollapsed = useAppSelector(getLibraryCollapsed);
-  const hasState = useAppSelector((state) => !!state.spotify.state);
-  const activeOnOtherDevice = useAppSelector(isActiveOnOtherDevice);
-
-  const [isTablet, setIsTablet] = useState(false);
-
-  const isMobile = useIsMobile();
-  const showDetails = rightLayoutOpen && hasState;
-
-  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
-    id: 'persistence',
-    storage: localStorage,
-    panelIds: showDetails ? ['left', 'center', 'details-section'] : ['left', 'center'],
-  });
-
-  useEffect(() => {
-    window.onresize = () => {
-      const vh = window.innerWidth;
-      if (vh < 950) {
-        dispatch(uiActions.collapseLibrary());
-        setIsTablet(true);
-      } else {
-        setIsTablet(false);
-      }
-    };
-    return () => {
-      window.onresize = null;
-    };
-  }, [dispatch]);
-
-  useEffect(() => {
-    if (user) dispatch(spotifyActions.fetchDevices());
-  }, [user, dispatch]);
-
-  // In v4, Panel `style` applies to an inner wrapper — min/max width there no longer
-  // constrains the flex item, so unused outer width shows up as a gap. Use size props instead.
-  const leftPanelSize = isTablet
-    ? { minSize: pct(10), maxSize: pct(10), defaultSize: pct(10) }
-    : libraryCollapsed
-      ? { minSize: 85, maxSize: 85, defaultSize: 85 }
-      : { minSize: 280, maxSize: pct(28), defaultSize: pct(22) };
-
-  return (
-    <>
-      {/* Modals & Drawers */}
-      <LanguageModal />
-      <LibraryDrawer />
-      <PlayingNowDrawer />
-      <EditPlaylistModal />
-      <LoginModal />
-
-      {/* Main Component */}
-      <div className='main-container'>
-        <Row
-          wrap
-          justify='end'
-          gutter={[8, 8]}
-          style={{
-            overflow: 'hidden',
-            height: `calc(100vh - ${
-              activeOnOtherDevice ? '141' : !user && isMobile ? '0' : '105'
-            }px)`,
-          }}
-        >
-          <Col span={24}>
-            <Navbar />
-          </Col>
-
-          <Col
-            span={24}
-            style={{
-              maxHeight: activeOnOtherDevice ? `calc(100vh - 185px)` : undefined,
-            }}
-          >
-            <Group
-              orientation='horizontal'
-              defaultLayout={defaultLayout}
-              onLayoutChanged={onLayoutChanged}
-              style={{ height: '100%', width: '100%' }}
-            >
-              <Panel
-                id='left'
-                className='mobile-hidden'
-                groupResizeBehavior={libraryCollapsed ? 'preserve-pixel-size' : 'preserve-relative-size'}
-                {...leftPanelSize}
-                style={{ borderRadius: 5 }}
-              >
-                <Library />
-              </Panel>
-
-              {!isMobile ? <Separator className='resize-handler' /> : null}
-
-              <Panel id='center' style={{ borderRadius: 5 }}>
-                {/* Home | Playlists */}
-                {props.children}
-              </Panel>
-
-              {showDetails ? (
-                <>
-                  {!isTablet ? <Separator className='resize-handler' /> : null}
-                  <Panel
-                    id='details-section'
-                    minSize={pct(23)}
-                    maxSize={pct(30)}
-                    defaultSize={pct(25)}
-                    style={{ borderRadius: 5 }}
-                  >
-                    <PlayingNow />
-                  </Panel>
-                </>
-              ) : null}
-            </Group>
-          </Col>
-        </Row>
-      </div>
-
-      {<footer>{user ? <PlayingBar /> : <LoginFooter />}</footer>}
-    </>
-  );
+  const { data: playlists = [], isError } = usePlaylistsQuery();
+  return <aside className="sidebar" aria-label="탐색">
+    <div className="brand"><FaCompactDisc aria-hidden /> Vinyl Music</div>
+    <nav className="nav">{NAV.map((n) => <NavLink key={n.to} to={n.to} end={n.end} className="nav__link">{n.icon}<span>{n.label}</span></NavLink>)}</nav>
+    <div className="sidebar__section"><span>재생목록</span><button type="button" className="icon-btn" aria-label="새 재생목록" onClick={() => dispatch(uiActions.openCreatePlaylist())}><FaPlus /></button></div>
+    {isError ? <p className="muted small">로컬 서버에 연결할 수 없습니다.</p> : playlists.length === 0 ? <p className="muted small">아직 재생목록이 없습니다.</p> :
+      <ul className="sidebar__playlists">{playlists.map((p) => <li key={p.id}><NavLink to={`/playlist/${p.id}`} className="nav__link nav__link--sub"><span className="ellipsis">{p.name}</span><span className="muted small">{p.track_count}</span></NavLink></li>)}</ul>}
+  </aside>;
 });
-
-AppLayout.displayName = 'AppLayout';
+Sidebar.displayName = 'Sidebar';
+const MOBILE_NAV: { to: string; label: string; icon: ReactNode; end?: boolean }[] = [
+  { to: '/', label: '홈', icon: <FaHome />, end: true },
+  { to: '/search', label: '검색', icon: <FaSearch /> },
+  { to: '/library', label: '보관함', icon: <MdLibraryMusic /> },
+  { to: '/now-playing', label: '재생 중', icon: <FaCompactDisc /> },
+];
+export const AppLayout = ({ children }: { children: ReactNode }) => {
+  const queueOpen = useAppSelector((s) => s.ui.queueOpen);
+  const location = useLocation();
+  const mainRef = useRef<HTMLElement>(null);
+  useEffect(() => { mainRef.current?.scrollTo({ top: 0 }); }, [location.pathname]);
+  return <div className={`app${queueOpen ? ' app--queue' : ''}`}>
+    <Sidebar /><main className="main" ref={mainRef} id="main">{children}</main>
+    {queueOpen && <QueuePanel />}<PlayingBar />
+    <nav className="mobile-nav" aria-label="모바일 탐색">{MOBILE_NAV.map((n) => <NavLink key={n.to} to={n.to} end={n.end} className="mobile-nav__link">{n.icon}<span>{n.label}</span></NavLink>)}</nav>
+    <PlaylistModals />
+  </div>;
+};

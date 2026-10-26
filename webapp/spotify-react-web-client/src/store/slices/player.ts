@@ -98,6 +98,17 @@ const slice = createSlice({
         state.order.push(state.queue.length - 1);
       }
     },
+    /** Reorder play-order entries without changing which track is selected. */
+    moveInQueue(state, action: PayloadAction<{ from: number; to: number }>) {
+      const { from, to } = action.payload;
+      const n = state.order.length;
+      if (from < 0 || from >= n || to < 0 || to >= n || from === to) return;
+      const [entry] = state.order.splice(from, 1);
+      state.order.splice(to, 0, entry);
+      if (state.index === from) state.index = to;
+      else if (from < state.index && to >= state.index) state.index -= 1;
+      else if (from > state.index && to <= state.index) state.index += 1;
+    },
     /** Remove the entry at `position` of the play order. The current track cannot be removed. */
     removeFromQueue(state, action: PayloadAction<number>) {
       const result = removeFromOrder(state.order, state.index, action.payload);
@@ -247,6 +258,16 @@ export const playQueuePosition =
   (dispatch) => {
     dispatch(playerActions.jumpTo(position));
     dispatch(startCurrent());
+  };
+
+/** Stop playback and remove the source before clearing the queue. */
+export const stopAndClear =
+  (): PlayerThunk =>
+  (dispatch) => {
+    audioEngine.pause();
+    audioEngine.element.removeAttribute('src');
+    audioEngine.element.load();
+    dispatch(playerActions.clearQueue());
   };
 
 /**

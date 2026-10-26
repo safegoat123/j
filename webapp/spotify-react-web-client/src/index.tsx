@@ -1,17 +1,9 @@
 import ReactDOM from 'react-dom/client';
-import './index.css';
 import App from './App';
 import reportWebVitals from './reportWebVitals';
 
 import './i18n';
 
-import TimeAgo from 'javascript-time-ago';
-
-import en from 'javascript-time-ago/locale/en';
-import es from 'javascript-time-ago/locale/es-AR';
-
-TimeAgo.addDefaultLocale(en);
-TimeAgo.addLocale(es);
 
 const root = ReactDOM.createRoot(document.getElementById('root') as HTMLElement);
 // NOTE: StrictMode is intentionally disabled. In dev it double-invokes every effect, which
