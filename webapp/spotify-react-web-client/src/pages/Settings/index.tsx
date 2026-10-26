@@ -19,7 +19,8 @@ export default function Settings() {
     if (job && job.status !== 'running' && job.status !== 'pending') {
       setJobId(null);
       void reloadFolders();
-      message[job.status === 'finished' ? 'success' : 'error'](job.status === 'finished' ? '라이브러리 스캔이 완료되었습니다.' : (job.message ?? '스캔에 실패했습니다.'));
+      if (job.status === 'finished') message.success('라이브러리 스캔이 완료되었습니다.');
+      else message.error(job.message ?? '스캔에 실패했습니다.');
     }
   }, [job?.status, job?.message, message, reloadFolders]);
 
