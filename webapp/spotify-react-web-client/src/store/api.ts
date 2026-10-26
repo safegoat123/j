@@ -26,12 +26,12 @@ export type ApiError = { status?: number | string; data?: unknown };
 
 export const errorMessage = (e: unknown): string => {
   const err = e as { status?: unknown; data?: { detail?: unknown } | unknown; error?: string };
-  if (!err) return 'Unknown error';
-  if (err.status === 'FETCH_ERROR') return 'Cannot reach the local Vinyl Music server (is it running on :8000?)';
+  if (!err) return '알 수 없는 오류';
+  if (err.status === 'FETCH_ERROR') return '로컬 Vinyl Music 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인해 주세요 (기본 포트 8000).';
   const detail = (err.data as { detail?: unknown })?.detail;
   if (typeof detail === 'string') return detail;
   if (Array.isArray(detail)) return detail.map((d) => d?.msg).join(', ');
-  return err.error || `Request failed (${String(err.status)})`;
+  return err.error || `요청이 실패했습니다 (${String(err.status)})`;
 };
 
 export const api = createApi({
