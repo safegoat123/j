@@ -32,8 +32,8 @@ export const SeekBar = memo(() => {
   return <div className="seek" role="group" aria-label="재생 위치">
     <span className="time">{formatTime(value)}</span>
     <Slider className="seek__slider" min={0} max={Math.max(duration, 0.1)} step={0.1} value={Math.min(value, duration || 0)} disabled={!hasTrack || !duration}
-      tooltip={{ formatter: (v) => formatTime(v ?? 0) }} onChange={(v: number) => setDrag(v)}
-      onChangeComplete={(v: number) => { dispatch(seekTo(v)); setDrag(null); }} />
+      tooltip={{ formatter: (v) => formatTime(v ?? 0) }} onChange={(v) => setDrag(Array.isArray(v) ? v[0] : v)}
+      onChangeComplete={(v) => { dispatch(seekTo(Array.isArray(v) ? v[0] : v)); setDrag(null); }} />
     <span className="time">{formatTime(duration)}</span>
   </div>;
 });
@@ -45,7 +45,7 @@ export const VolumeControl = memo(() => {
   const muted = useAppSelector((s) => s.player.muted);
   return <div className="volume" role="group" aria-label="음량">
     <button type="button" className="icon-btn" aria-label={muted ? '음소거 해제' : '음소거'} aria-pressed={muted} onClick={() => dispatch(playerActions.toggleMute())}>{muted || volume === 0 ? <FaVolumeMute /> : <FaVolumeUp />}</button>
-    <Slider className="volume__slider" min={0} max={1} step={0.01} value={muted ? 0 : volume} tooltip={{ formatter: (v) => `${Math.round((v ?? 0) * 100)}%` }} onChange={(v: number) => dispatch(playerActions.setVolume(v))} />
+    <Slider className="volume__slider" min={0} max={1} step={0.01} value={muted ? 0 : volume} tooltip={{ formatter: (v) => `${Math.round((v ?? 0) * 100)}%` }} onChange={(v) => dispatch(playerActions.setVolume(Array.isArray(v) ? v[0] : v))} />
   </div>;
 });
 VolumeControl.displayName = 'VolumeControl';
