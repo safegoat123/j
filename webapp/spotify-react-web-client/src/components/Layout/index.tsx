@@ -9,7 +9,7 @@ import PlayingBar from '../PlayingBar';
 import QueuePanel from '../QueuePanel';
 import { PlaylistModals } from '../Modals/PlaylistModals';
 
-const NAV = [
+const NAV: { to: string; label: string; icon: ReactNode; end?: boolean }[] = [
   { to: '/', label: '홈', icon: <FaHome />, end: true },
   { to: '/search', label: '검색', icon: <FaSearch /> },
   { to: '/library', label: '보관함', icon: <MdLibraryMusic /> },
@@ -28,7 +28,7 @@ const Sidebar = memo(() => {
   </aside>;
 });
 Sidebar.displayName = 'Sidebar';
-const MOBILE_NAV = [
+const MOBILE_NAV: { to: string; label: string; icon: ReactNode; end?: boolean }[] = [
   { to: '/', label: '홈', icon: <FaHome />, end: true },
   { to: '/search', label: '검색', icon: <FaSearch /> },
   { to: '/library', label: '보관함', icon: <MdLibraryMusic /> },
