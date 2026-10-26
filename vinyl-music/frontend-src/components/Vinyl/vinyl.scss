@@ -1,0 +1,17 @@
+.vinyl-stage { display: flex; gap: 32px; align-items: center; justify-content: center; padding: 24px;
+  background: radial-gradient(circle at 30% 20%, var(--album-bg), #0b0b0b 70%); color: var(--album-text);
+  flex-wrap: wrap; transition: background .6s ease; }
+.vinyl-cover { width: min(70vw, 320px); aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: #282828;
+  box-shadow: 0 8px 30px rgba(0,0,0,.5);
+  img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  &__placeholder { width: 100%; height: 100%; display: grid; place-items: center; font-size: 72px; color: #777; } }
+.vinyl { position: relative; width: min(70vw, 320px); aspect-ratio: 1; }
+.vinyl__disc { width: 100%; height: 100%; border-radius: 50%;
+  background: radial-gradient(circle, #111 0 30%, transparent 30%), repeating-radial-gradient(circle, #1a1a1a 0 2px, #0c0c0c 2px 4px);
+  box-shadow: 0 10px 40px rgba(0,0,0,.6); animation: vinyl-spin 1.8s linear infinite; }
+.vinyl__label { position: absolute; inset: 33%; border-radius: 50%; background: var(--album-accent);
+  &::after { content: ''; position: absolute; inset: 44%; border-radius: 50%; background: #000; } }
+.vinyl__arm { position: absolute; top: -4%; right: -6%; width: 7%; height: 62%; transform-origin: 50% 6%;
+  transition: transform .5s ease; background: linear-gradient(#d0d0d0, #8a8a8a); border-radius: 6px; }
+@keyframes vinyl-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .vinyl__disc { animation: none; } .vinyl__arm { transition: none; } }
