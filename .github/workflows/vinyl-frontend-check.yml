@@ -1,0 +1,33 @@
+name: Vinyl Music frontend checks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "webapp/spotify-react-web-client/**"
+      - ".github/workflows/vinyl-frontend-check.yml"
+  workflow_dispatch:
+
+jobs:
+  typecheck-and-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp/spotify-react-web-client
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+          cache-dependency-path: webapp/spotify-react-web-client/yarn.lock
+      - name: Enable Yarn Classic
+        run: corepack enable
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: TypeScript check
+        run: yarn typecheck
+      - name: Production build
+        run: yarn build
