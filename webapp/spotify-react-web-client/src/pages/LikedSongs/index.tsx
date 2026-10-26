@@ -1,4 +1,3 @@
-import { FaHeart } from 'react-icons/fa';
 import { useLikedQuery } from '../../store/api';
 import { PageHeader } from '../../components/PageHeader';
 import { TrackList } from '../../components/TrackList';
